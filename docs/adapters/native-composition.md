@@ -98,7 +98,10 @@ its own KV event stream. A requested deterministic selector uses
 
 Device (G1) events omit `tier`; a missing `tier` means `device`. A vLLM rank
 with G2 also publishes G2 residency changes as `Stored`/`Removed` events with
-`"tier": "host_pinned"`, as vLLM's offloading connector does. With
+`"tier": "host_pinned"`, as vLLM's offloading connector does. An SGLang rank
+with HiCache `write_back` publishes them for its own host cache: `Stored` when
+G1 eviction copies a block to host, `Removed` when host eviction drops it,
+both before the G1 `Removed` of the same eviction. With
 `dp_rank_local` these cover the rank's own cache. With `cluster_shared` they
 cover the whole pool, starting with a snapshot when the rank joins. A child block can become resident before its parent, so each
 `Stored` run carries the prompt index of its first block as `start_position`.

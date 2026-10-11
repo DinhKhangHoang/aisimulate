@@ -83,5 +83,5 @@ for both roles.
   layout conversion between different TP shapes, and network contention
   between concurrent transfers are not modeled.
 - Bandwidth applies to each transfer independently.
-- vLLM P/D can be combined with G2 host offload; see
+- vLLM and SGLang P/D can be combined with G2 host offload; see
   [KV cache](kv-cache.md#host-offload-g2). G3 offload is aggregated-only.

@@ -231,8 +231,8 @@ prefixes likewise describe workload sharing, not guaranteed hits. Enable
 `kv_cache.prefix_caching` on supported backends; enabling it alone creates no
 shared input.
 
-`kv_cache.host_offload` adds vLLM host-cache simulation, with no AIC CLI flag
-counterpart. It requires prefix caching and supports aggregated or token-only
+`kv_cache.host_offload` adds vLLM or SGLang HiCache host-cache simulation, with
+no AIC CLI flag counterpart. It requires prefix caching and supports aggregated or token-only
 P/D workers, including attention DP. Recommendation keeps host capacity and
 bandwidth fixed while searching supported parallelism. Cluster-shared G2 on
 both P/D roles requires identical explicit integer tensor/pipeline values.

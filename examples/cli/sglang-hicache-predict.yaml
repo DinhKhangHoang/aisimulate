@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SGLang HiCache write_back (G2) for two replicas with attention DP 2: each of
+# the four DP ranks has a private host cache that G1 evictions are copied into.
+# Fixed timing isolates cache behaviour from performance data.
+#   aisimulate predict --stack engine --config examples/cli/sglang-hicache-predict.yaml \
+#     --capture-per-request
+# Disable G2 with --set engine.workers.aggregated.kv_cache.host_offload=null.
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 8, cached_prefix_tokens: 896}
+  load: {type: concurrency, concurrency: 8}
+  stop: {requests: 64}
+engine:
+  model: Qwen/Qwen3-32B-FP8
+  hardware: h200_sxm
+  backend: sglang
+  backend_version: 0.5.14
+  context_length: 4096
+  mode: aggregated
+  workers:
+    aggregated:
+      parallelism: {replicas: 2, tensor: 1, pipeline: 1, attention_data: 2, moe_tensor: 1, moe_expert: 1}
+      scheduler: {max_batched_tokens: 8192, max_sequences: 2}
+      kv_cache:
+        block_size: 16
+        bytes_per_token: 131072
+        capacity: {type: fixed, blocks: 160}
+        host_offload:
+          scope: dp_rank_local
+          num_host_blocks: 1024
+          d2h_bandwidth_gbps: 32
+          h2d_bandwidth_gbps: 32
+      timing: {type: fixed, prefill_ms: 20.0, decode_ms: 5.0}

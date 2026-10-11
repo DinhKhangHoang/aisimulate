@@ -91,7 +91,8 @@ what Replay actually reused.
 
 G2 keeps copies of KV blocks in host memory. When a prefix has been evicted
 from G1, a later request can restore it over PCIe instead of recomputing it.
-It follows vLLM's native CPU offload.
+With vLLM it follows vLLM's native CPU offload; with SGLang it follows
+HiCache in `write_back` mode, see [SGLang HiCache](#sglang-hicache-g2).
 
 ```yaml
 # host-offload-prediction.yaml
@@ -126,7 +127,7 @@ aisimulate predict --stack engine --config host-offload-prediction.yaml --captur
 | Knob (under `host_offload`) | Default | Rules |
 |---|---|---|
 | `num_host_blocks` | Required | Positive. Per DP rank with `dp_rank_local`; total pool size with `cluster_shared`. |
-| `scope` | `dp_rank_local` | `dp_rank_local` or `cluster_shared`; see [scope](#g2-scope). |
+| `scope` | `dp_rank_local` | `dp_rank_local` or `cluster_shared` (vLLM only); see [scope](#g2-scope). |
 | `d2h_bandwidth_gbps` | `32.0` | GPU→host bandwidth per DP rank, decimal GB/s. `0` means unlimited. |
 | `h2d_bandwidth_gbps` | `32.0` | Host→GPU bandwidth per DP rank, decimal GB/s. `0` means unlimited. |
 | `latency_to_first_byte_ms` | `0.0` | Fixed delay before each transfer starts moving bytes. |
@@ -137,9 +138,10 @@ aisimulate predict --stack engine --config host-offload-prediction.yaml --captur
 
 ### How G2 behaves
 
-- A block's size is `block_size × bytes_per_token`, the same per-TP-shard bytes
-  as G1. No TP multiplier is applied to host capacity or transfer time, so an
-  explicit `bytes_per_token` must use the same unit as the bandwidths.
+A block's size is `block_size × bytes_per_token`, the same per-TP-shard bytes
+as G1. No TP multiplier is applied to host capacity or transfer time, so an
+explicit `bytes_per_token` must use the same unit as the bandwidths. With vLLM:
+
 - Blocks are copied to G2 after they are computed in G1. A request that finds its
   prefix in G2 waits for the host→GPU copy before it is admitted, so restore
   time adds to TTFT.
@@ -154,7 +156,7 @@ aisimulate predict --stack engine --config host-offload-prediction.yaml --captur
 
 | `scope` | Pools | `num_host_blocks` means | Bandwidth |
 | --- | --- | --- | --- |
-| `dp_rank_local` | One per DP rank, as in vLLM | Per rank | Each rank's own D2H and H2D limits |
+| `dp_rank_local` | One per DP rank, as in vLLM and SGLang HiCache | Per rank | Each rank's own D2H and H2D limits |
 | `cluster_shared` | One for the whole deployment | Total for the pool | Rank limits, also capped by the pool's shared limits |
 
 For example, two replicas with `attention_data: 2` and `num_host_blocks: 4096`
@@ -171,14 +173,53 @@ and shared bandwidths; otherwise the run is rejected. In `recommend` with
 `cluster_shared` on both P/D roles, pin each role's `tensor` and `pipeline` with
 `parallelism.preset: false`.
 
+<a id="sglang-hicache-g2"></a>
+
+### SGLang HiCache (write_back)
+
+With `backend: sglang`, the same `host_offload` block models SGLang HiCache with
+`--hicache-write-policy write_back`. The host cache lives in the rank's radix
+tree, and `num_host_blocks` counts SGLang pages of `block_size` tokens.
+
+- Nothing is copied when a prefix is computed. A page is copied to host when
+  G1 evicts it. If host is full, its least recently used unlocked pages are
+  dropped first; if it still has no room, the G1 page is dropped.
+- The GPU→host copy is synchronous, as in SGLang: the forward pass that
+  needed the room starts only after the copy finishes.
+- A prompt whose prefix is on host loads it back when the host hit is 10 or
+  more tokens; shorter hits are recomputed. The host→GPU copy starts with the
+  prefill pass, and the pass computes after the copy finishes. SGLang overlaps
+  the copy with compute layer by layer, so this is conservative. The host copy
+  stays after the load.
+- Loaded tokens count as cached prefix in `reused_input_tokens` and prefill
+  timing. `first_admission_host_reused_input_tokens` is not split out for
+  SGLang yet.
+- A decode worker receiving a P/D handoff matches only its G1; host hits are
+  not loaded back there. SGLang's limit of three loads in flight is not
+  applied.
+
+[`examples/cli/sglang-hicache-predict.yaml`](../../../examples/cli/sglang-hicache-predict.yaml)
+is a runnable SGLang configuration.
+
+`write_through` and `write_through_selective` are not modelled. Nor are
+`cluster_shared` (HiCache is private to each DP rank), `g3_offload` and Belady
+eviction; each is rejected with an explicit message. With a timing provider
+whose prefill prediction can fail, such as `timing: {type: default}`, a failed
+prefill cannot be rolled back after evictions, load-backs and KV events. The
+rank then stops and the run fails with an error naming `native_host_offload`.
+`fixed` and `polynomial` timing cannot fail.
+
 ### Supported
 
-G2 supports vLLM aggregated and token-only disaggregated workers with prefix
-caching and any `attention_data`. It is rejected with SGLang, TensorRT-LLM,
-native MTP, ngram speculation, `state_cache`, and Belady eviction.
+G2 supports vLLM and SGLang aggregated and token-only disaggregated workers
+with prefix caching and any `attention_data`. SGLang uses `dp_rank_local` only.
+It is rejected with TensorRT-LLM, native MTP, ngram speculation, `state_cache`,
+and Belady eviction. [Agentic G2](#agentic-g2) is vLLM only.
 
 For shared pools, the report's `g2_domains` gives capacity and resident blocks.
-Workers that publish KV events report G2 changes with `"tier": "host_pinned"`;
+Workers that publish KV events report G2 changes with `"tier": "host_pinned"`.
+An SGLang rank publishes `Stored` when a page is copied to host and `Removed`
+when one is dropped from host, ahead of the same eviction's G1 removals;
 see [KV events](../../adapters/native-composition.md#kv-events).
 
 <a id="g3-offload"></a>
