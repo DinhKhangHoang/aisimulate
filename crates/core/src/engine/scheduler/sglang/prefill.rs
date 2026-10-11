@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use super::super::AdmissionEvent;
 use super::config::{SglangConfig, ceil_to_block};
 use super::request::{SglangRequest, WaitingQueue};
+use crate::engine::CacheTierAttribution;
 use crate::engine::kv_manager::SglangKvManager;
 use crate::engine::kv_manager::sglang_backend::{
     AdmittedPrefix, HostLoad, LoadBackGate, RequestAdmission,
@@ -187,12 +188,13 @@ pub(super) fn get_new_batch_prefill(
             )
         };
 
-        let prefix_len = match admitted {
+        let (prefix_len, loaded_tokens) = match admitted {
             RequestAdmission::Admitted(AdmittedPrefix { prefix_len, load }) => {
+                let loaded_tokens = load.as_ref().map_or(0, |load| load.tokens);
                 if let Some(load) = load {
                     host_loads.push(*load);
                 }
-                prefix_len
+                (prefix_len, loaded_tokens)
             }
             // `NoRoom` is the old allocation failure; a load it started still runs, so the
             // scheduler times it with this batch. `WaitForLoadSlot` keeps the request waiting the
@@ -236,10 +238,29 @@ pub(super) fn get_new_batch_prefill(
         // One admission per request: a continuation chunk is the same admission still running,
         // not a readmission.
         if first_admission {
+            // Cache-tier provenance of `reused_input_tokens`, under HiCache write_back only, as
+            // vLLM's native host tier reports it (`VllmHostOffloadAdapter::on_admitted`):
+            // - `g1` is the prefix already on device at admission and `host` the prefix loaded
+            //   back from host by this admission; they sum to `reused_input_tokens`, the cached
+            //   prompt tokens (capped at `input_len - 1`), loaded tokens included.
+            // - The denominator is therefore the request's reuse, not its prompt length: a
+            //   host-hit rate is `sum(host) / sum(prompt tokens)` over requests, or
+            //   `sum(host) / sum(g1 + host)` for the host share of hits.
+            // - Only a request's first admission reports it; a readmission after retraction
+            //   reports `None`. SGLang 0.5.18 likewise computes `cached_tokens_device` /
+            //   `cached_tokens_host` (`meta_info.cached_tokens_details`) once, on the first
+            //   chunk, from `prefix_indices` and `host_hit_length`, and skips retracted requests.
+            // - Without write_back there is no host tier and the attribution stays `None`.
+            let cache_tier_attribution = (kv_manager.is_write_back()
+                && !std::mem::replace(&mut req.first_admission_recorded, true))
+            .then(|| CacheTierAttribution {
+                g1_reused_input_tokens: admission_reused_tokens - loaded_tokens,
+                host_reused_input_tokens: loaded_tokens,
+            });
             admissions.push(AdmissionEvent {
                 uuid: req.uuid,
                 reused_input_tokens: admission_reused_tokens,
-                cache_tier_attribution: None,
+                cache_tier_attribution,
             });
         }
         prefill_fpm.push(PrefillFpmItem {

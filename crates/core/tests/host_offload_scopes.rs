@@ -711,8 +711,12 @@ fn sglang_write_back_host_pinned_events_balance_under_host_pressure() {
         .filter(|(_, reused)| *reused > 0)
         .collect::<Vec<_>>();
     assert_eq!(reused, [("r05".to_string(), 12)]);
-    // SGLang admissions do not yet split reuse by tier.
-    assert_eq!(host_reuse(&report), [None; 16]);
+    // First admissions split reuse by tier: r05's reuse is all host-loaded.
+    let host = host_reuse(&report);
+    let expected = (0..16)
+        .map(|index| Some(if index == 5 { 12 } else { 0 }))
+        .collect::<Vec<_>>();
+    assert_eq!(host, expected);
     // The run is deterministic; pin the event balance.
     assert_eq!((stored, removed, resident.len()), (52, 44, 8));
 }

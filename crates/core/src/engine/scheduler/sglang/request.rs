@@ -25,6 +25,10 @@ pub(super) struct SglangRequest {
     pub(super) kv_lease: RadixRequestLease,
     pub(super) materialized_tokens: usize,
     pub(super) allocated_tokens: usize,
+    /// Set once the request's first admission reported its cache-tier
+    /// attribution; a readmission after retraction reports none (vLLM
+    /// `first_admission_recorded`).
+    pub(super) first_admission_recorded: bool,
 }
 
 impl SglangRequest {
@@ -53,6 +57,7 @@ impl SglangRequest {
             kv_lease,
             materialized_tokens: 0,
             allocated_tokens: 0,
+            first_admission_recorded: false,
         }
     }
 

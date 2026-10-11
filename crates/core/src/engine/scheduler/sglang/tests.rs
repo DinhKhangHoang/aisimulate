@@ -390,6 +390,7 @@ fn zero_output_completion_survives_decode_reservation_failure() {
             kv_lease: zero_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         },
         SglangRequest {
             is_decode_handoff: false,
@@ -401,6 +402,7 @@ fn zero_output_completion_survives_decode_reservation_failure() {
             kv_lease: normal_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         },
     ];
 
@@ -453,6 +455,7 @@ fn retraction_ratio_is_estimated_from_survivors_before_the_forward() {
             kv_lease: r1_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         },
         SglangRequest {
             is_decode_handoff: false,
@@ -464,6 +467,7 @@ fn retraction_ratio_is_estimated_from_survivors_before_the_forward() {
             kv_lease: r2_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         },
     ];
     let result = simulate_decode_step(&mut running, &mut kv_manager, &config, 0.0, false);
@@ -500,6 +504,7 @@ fn committed_decode_membership_excludes_retracted_requests() {
             kv_lease: allocation.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         });
     }
     let pass = core.execute_hidden_pass(0.0);
@@ -542,6 +547,7 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         materialized_tokens: 0,
         kv_lease: RadixRequestLease::default(),
         allocated_tokens: 0,
+        first_admission_recorded: false,
     }]);
     let req = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[])
         .can_run
@@ -567,6 +573,7 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         kv_lease: blocker_alloc.lease,
         materialized_tokens: 3,
         allocated_tokens: 4,
+        first_admission_recorded: false,
     };
     buffer.drain();
 
@@ -1234,6 +1241,7 @@ mod scheduling {
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
                 allocated_tokens: 0,
+                first_admission_recorded: false,
             },
             SglangRequest {
                 is_decode_handoff: false,
@@ -1245,6 +1253,7 @@ mod scheduling {
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
                 allocated_tokens: 0,
+                first_admission_recorded: false,
             },
         ]);
 
@@ -1279,6 +1288,7 @@ mod scheduling {
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
                 allocated_tokens: 0,
+                first_admission_recorded: false,
             });
         }
         let unique_uuid = Uuid::new_v4();
@@ -1292,6 +1302,7 @@ mod scheduling {
             materialized_tokens: 0,
             kv_lease: RadixRequestLease::default(),
             allocated_tokens: 0,
+            first_admission_recorded: false,
         });
 
         apply_schedule_policy(&mut waiting, &kv_manager, &config);
@@ -1385,6 +1396,7 @@ mod core_behavior {
             materialized_tokens: 0,
             kv_lease: RadixRequestLease::default(),
             allocated_tokens: 0,
+            first_admission_recorded: false,
         }]);
 
         let admit = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[]);
@@ -1417,6 +1429,7 @@ mod core_behavior {
             kv_lease: alloc.lease,
             materialized_tokens: 6,
             allocated_tokens: 8,
+            first_admission_recorded: false,
         }];
 
         let first = simulate_decode_step(&mut running, &mut kv_manager, &config, 0.0, false);
@@ -1462,6 +1475,7 @@ mod core_behavior {
             kv_lease: base_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         }];
 
         let mut fast_kv_manager = SglangKvManager::new(64, 4, KvEventPublishers::default(), 0);
@@ -1476,6 +1490,7 @@ mod core_behavior {
             kv_lease: fast_alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         }];
 
         let base = simulate_decode_step(
@@ -1526,6 +1541,7 @@ mod core_behavior {
                 kv_lease: RadixRequestLease::from_parts(first, 8, 4, kv_manager.cache().root()),
                 materialized_tokens: 8,
                 allocated_tokens: 8,
+                first_admission_recorded: false,
             },
             SglangRequest {
                 is_decode_handoff: false,
@@ -1537,6 +1553,7 @@ mod core_behavior {
                 kv_lease: RadixRequestLease::from_parts(second, 5, 4, kv_manager.cache().root()),
                 materialized_tokens: 5,
                 allocated_tokens: 8,
+                first_admission_recorded: false,
             },
         ];
 
@@ -1569,6 +1586,7 @@ mod core_behavior {
             kv_lease: alloc.lease,
             materialized_tokens: 4,
             allocated_tokens: 4,
+            first_admission_recorded: false,
         }];
 
         simulate_decode_step(&mut running, &mut kv_manager, &config, 0.0, false);
@@ -3402,6 +3420,7 @@ fn native_host_offload_builds_a_write_back_kv_manager() {
 /// D2H/H2D timing model and load-back completion.
 mod hicache_write_back {
     use super::*;
+    use crate::engine::CacheTierAttribution;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3469,6 +3488,7 @@ mod hicache_write_back {
 
     struct Run {
         reused_input_tokens: usize,
+        attribution: Option<CacheTierAttribution>,
         started_ms: f64,
         first_token_ms: f64,
         end_ms: f64,
@@ -3480,12 +3500,14 @@ mod hicache_write_back {
         let uuid = core.receive(direct_request(tokens, 1));
         let mut now_ms = now;
         let mut reused_input_tokens = None;
+        let mut attribution = None;
         let mut first_token_ms = None;
         for _ in 0..20 {
             let pass = core.execute_hidden_pass(now_ms);
             core.complete_engine_boundary(pass.end_ms);
             if let Some(admission) = pass.admissions.iter().find(|a| a.uuid == uuid) {
                 reused_input_tokens = Some(admission.reused_input_tokens);
+                attribution = admission.cache_tier_attribution;
             }
             let signal = pass.output_signals.iter().find(|s| s.uuid == uuid);
             if signal.is_some_and(|s| s.token_id.is_some()) && first_token_ms.is_none() {
@@ -3495,6 +3517,7 @@ mod hicache_write_back {
             if signal.is_some_and(|s| s.completed) {
                 return Run {
                     reused_input_tokens: reused_input_tokens.expect("admitted"),
+                    attribution,
                     started_ms: now,
                     first_token_ms: first_token_ms.expect("first token"),
                     end_ms: now_ms,
@@ -3606,6 +3629,123 @@ mod hicache_write_back {
         }
         assert_eq!((passes, now - b.end_ms), (2, 32.0));
         assert_no_pinned_load_backs(&mut core);
+    }
+
+    fn tiers(g1: usize, host: usize) -> Option<CacheTierAttribution> {
+        Some(CacheTierAttribution {
+            g1_reused_input_tokens: g1,
+            host_reused_input_tokens: host,
+        })
+    }
+
+    /// Under write_back, a first admission splits its reuse into tokens
+    /// already on device and tokens loaded back from host, summing to
+    /// `reused_input_tokens` (vLLM's `on_admitted` semantics). Without host
+    /// offload there is no attribution.
+    #[test]
+    fn write_back_first_admission_attributes_reuse_by_tier() {
+        let mut write_back = core(Some((0.0, 0.0)));
+        let (a, b, again) = repeat_after_pressure(&mut write_back);
+        assert_eq!(a.attribution, tiers(0, 0));
+        assert_eq!(b.attribution, tiers(0, 0));
+        assert_eq!(again.attribution, tiers(0, 28));
+        // The loaded prompt is now device-resident.
+        let device = run(&mut write_back, prompt_a(), again.end_ms);
+        assert_eq!(device.attribution, tiers(28, 0));
+
+        let mut recompute = core(None);
+        let (a, _, again) = repeat_after_pressure(&mut recompute);
+        assert_eq!((a.attribution, again.attribution), (None, None));
+        let device = run(&mut recompute, prompt_a(), again.end_ms);
+        assert_eq!(device.reused_input_tokens, 28);
+        assert_eq!(device.attribution, None);
+    }
+
+    /// A device prefix plus a host continuation splits at the device boundary.
+    #[test]
+    fn write_back_attribution_splits_a_device_prefix_from_its_host_suffix() {
+        let mut core = core(Some((0.0, 0.0)));
+        // Cache a 3-page prefix P, then P plus 4 more pages.
+        let prefix: Vec<u32> = (0..12).collect();
+        let full: Vec<u32> = (0..28).collect();
+        let p = run(&mut core, prefix.clone(), 0.0);
+        let f = run(&mut core, full.clone(), p.end_ms);
+        assert_eq!(f.attribution, tiers(12, 0));
+        // Touch P so the 4-page suffix is the LRU leaf, then demote it.
+        let touch = run(
+            &mut core,
+            prefix.iter().copied().chain([500]).collect(),
+            f.end_ms,
+        );
+        let pressure = run(&mut core, (1000..1048).collect(), touch.end_ms);
+        let mut prompt = full;
+        prompt.push(28);
+        let again = run(&mut core, prompt, pressure.end_ms);
+        assert_eq!(again.reused_input_tokens, 28);
+        assert_eq!(again.attribution, tiers(12, 16));
+        assert_no_pinned_load_backs(&mut core);
+    }
+
+    /// A readmission after retraction reports no attribution: only the first
+    /// admission counts, as in SGLang (`cached_tokens_details` is computed
+    /// once and skipped for retracted requests) and vLLM.
+    #[test]
+    fn readmission_after_retraction_reports_no_tier_attribution() {
+        let mut args = test_args(2, PAGE, 16);
+        args.enable_prefix_caching = true;
+        args.kv_cache_bytes_per_token = Some(BYTES_PER_TOKEN);
+        args.native_host_offload = Some(crate::engine::NativeHostOffloadConfig::new(64));
+        let mut core = SglangCore::new(args);
+        install_timing(&mut core, None);
+        let completed = Uuid::from_u128(90_012);
+        let retracted = Uuid::from_u128(90_013);
+        // As `committed_decode_membership_excludes_retracted_requests`: both
+        // fill a page and need one more; the one without output is retracted.
+        for (uuid, tokens, prompt_len, max_output_tokens) in [
+            (completed, vec![1, 2, 3, 10], 3, 2),
+            (retracted, vec![5, 6, 7, 8], 4, 2),
+        ] {
+            core.receive(DirectRequest {
+                uuid: Some(uuid),
+                ..direct_request(tokens[..prompt_len].to_vec(), max_output_tokens)
+            });
+            core.waiting.pop_front().unwrap();
+            let allocation = core.kv_manager.allocate_for_request(&tokens).unwrap();
+            core.running.push(SglangRequest {
+                is_decode_handoff: false,
+                uuid,
+                sequence_tokens: tokens,
+                prompt_len,
+                max_output_tokens,
+                planned_output_ids: None,
+                kv_lease: allocation.lease,
+                materialized_tokens: 4,
+                allocated_tokens: 4,
+                // Admitted earlier, through prefill.
+                first_admission_recorded: true,
+            });
+        }
+        let mut now = 0.0;
+        let mut readmissions = Vec::new();
+        for _ in 0..50 {
+            if core.is_empty() {
+                break;
+            }
+            let pass = core.execute_hidden_pass(now);
+            core.complete_engine_boundary(pass.end_ms);
+            readmissions.extend(
+                pass.admissions
+                    .iter()
+                    .filter(|a| a.uuid == retracted)
+                    .map(|a| a.cache_tier_attribution),
+            );
+            now = pass.end_ms;
+        }
+        assert!(
+            !readmissions.is_empty(),
+            "the retracted request is readmitted"
+        );
+        assert!(readmissions.iter().all(Option::is_none), "{readmissions:?}");
     }
 
     #[test]
