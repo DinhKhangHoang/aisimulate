@@ -161,7 +161,10 @@ pub(crate) struct AllocResult {
 
 /// Whether an admission may start an SGLang HiCache load-back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // `NoFreeSlot` is for disaggregated decode, which never loads back.
+// `NoFreeSlot` is unused outside tests. It is kept, with
+// `MAX_LOAD_BACK_IN_FLIGHT`, for a future load-slot gate such as one on
+// disaggregated decode, which does not load back today.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LoadBackGate {
     /// A load slot is free: load a host hit back before allocating the suffix.
     Allow,

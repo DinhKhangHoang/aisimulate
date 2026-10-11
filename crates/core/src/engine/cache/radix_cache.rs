@@ -293,8 +293,13 @@ pub(crate) const LOAD_BACK_THRESHOLD_TOKENS: usize = 10;
 /// `LayerDoneCounter.num_counters`, fixed at 3 ("extra producer and consumer
 /// counters for overlap mode", `LayerDoneCounter.__init__` in
 /// managers/cache_controller.py). A fourth load waits for a slot rather than
-/// falling back to recompute. The scheduler enforces it; the cache does not.
-#[allow(dead_code)] // Read by the SGLang scheduler once it drives load-back.
+/// falling back to recompute.
+///
+/// Not enforced yet: prefill admits with `LoadBackGate::Allow`, every load
+/// finishes at its pass's engine boundary, and one prefill batch may start
+/// more than three loads. Kept, with `LoadBackGate::NoFreeSlot`, for a future
+/// gate (for example on disaggregated decode, which does not load back today).
+#[allow(dead_code)]
 pub(crate) const MAX_LOAD_BACK_IN_FLIGHT: usize = 3;
 
 /// A prefix match that also reports the host-only continuation of the
