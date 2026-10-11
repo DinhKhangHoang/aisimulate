@@ -873,11 +873,11 @@ impl SglangKvManager {
 
     /// Evict tokens from the cache, publish BlockRemoved events, and log a trace.
     pub fn evict(&mut self, num_tokens: usize) {
-        let (evicted, evicted_pages) = self.cache.evict(num_tokens);
-        if !evicted_pages.is_empty() {
-            self.publish_removed_pages(&evicted_pages);
+        let outcome = self.cache.evict(num_tokens);
+        if !outcome.device_pages.is_empty() {
+            self.publish_removed_pages(&outcome.device_pages);
         }
-        self.log_trace("eviction", evicted);
+        self.log_trace("eviction", outcome.evicted_tokens);
     }
 
     fn free_pages(&mut self, pages: &[KvPageId]) {

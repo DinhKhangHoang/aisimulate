@@ -163,10 +163,123 @@ impl PagePool {
     }
 }
 
+/// Host page identifier in the simulated SGLang HiCache host pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostPageId(usize);
+
+/// Manages free / allocated pages for the simulated SGLang HiCache host pool.
+///
+/// The radix core stores these indices as a node's host value but never
+/// allocates them; SGLang's host pool does, as this pool does here. Host
+/// pages are whole device pages, so the pool counts pages, not tokens.
+#[derive(Clone)]
+pub struct HostPagePool {
+    next_fresh: usize,
+    free: Vec<HostPageId>,
+    total_pages: usize,
+}
+
+impl HostPagePool {
+    pub fn new(total_pages: usize) -> Self {
+        Self {
+            next_fresh: 0,
+            free: Vec::new(),
+            total_pages,
+        }
+    }
+
+    pub fn allocate_pages(&mut self, count: usize) -> Option<Vec<HostPageId>> {
+        if self.available_pages() < count {
+            return None;
+        }
+
+        let recycled = count.min(self.free.len());
+        let fresh = count - recycled;
+        let mut pages = Vec::with_capacity(count);
+        pages.extend(self.free.drain(self.free.len() - recycled..));
+        pages.extend((self.next_fresh..self.next_fresh + fresh).map(HostPageId));
+        self.next_fresh += fresh;
+        Some(pages)
+    }
+
+    pub fn free_pages(&mut self, pages: &[HostPageId]) {
+        for page in pages {
+            assert!(
+                page.0 < self.next_fresh,
+                "host page {page:?} was never allocated"
+            );
+        }
+        self.free.extend_from_slice(pages);
+        assert!(
+            self.free.len() <= self.next_fresh,
+            "more host pages freed than allocated"
+        );
+    }
+
+    pub fn available_pages(&self) -> usize {
+        self.free.len() + self.total_pages - self.next_fresh
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn total_pages(&self) -> usize {
+        self.total_pages
+    }
+}
+
+/// One host-pool change made during eviction, in the order it happened.
+///
+/// The order matters: one `evict()` call can free a host page and then reuse
+/// it for the next store, or store a page and then free it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPageEvent {
+    /// The KV of `device` was copied to `host`. The device page is still
+    /// allocated at that point, so its identity can be copied to the host
+    /// page; it is freed later in the same call and listed in
+    /// [`EvictionOutcome::device_pages`].
+    Stored { host: HostPageId, device: KvPageId },
+    /// The host page went back to the host pool.
+    Freed(HostPageId),
+}
+
+/// What one `RadixCache::evict` call released.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictionOutcome {
+    /// Tokens released from the device pool (`device_pages.len() * page_size`).
+    pub evicted_tokens: usize,
+    /// Device pages returned to the page pool, demoted pages included.
+    pub device_pages: Vec<KvPageId>,
+    /// Host-pool changes in order; always empty without write_back.
+    pub host_events: Vec<HostPageEvent>,
+}
+
+impl EvictionOutcome {
+    /// Host pages stored by write_back demotes, with their source device page.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stored_host(&self) -> impl Iterator<Item = (HostPageId, KvPageId)> + '_ {
+        self.host_events.iter().filter_map(|event| match *event {
+            HostPageEvent::Stored { host, device } => Some((host, device)),
+            HostPageEvent::Freed(_) => None,
+        })
+    }
+
+    /// Host pages returned to the host pool.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_frees(&self) -> impl Iterator<Item = HostPageId> + '_ {
+        self.host_events.iter().filter_map(|event| match *event {
+            HostPageEvent::Freed(host) => Some(host),
+            HostPageEvent::Stored { .. } => None,
+        })
+    }
+}
+
 pub(crate) struct InsertPageResult {
     pub(crate) last_node: NodeId,
     pub(crate) canonical_suffix: Vec<KvPageId>,
     pub(crate) unretained_pages: Vec<KvPageId>,
+    /// Host pages the insert released, already returned to the host pool. A
+    /// Full-only tree never produces them; see `collect_unretained_pages`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) unretained_host_pages: Vec<HostPageId>,
 }
 
 /// Shared immutable keys keep admission checkpoints proportional to node metadata.
@@ -215,6 +328,15 @@ impl From<KvPageId> for i64 {
 
 type SglangTree = UnifiedTreeCore<PageKey, PageValue<KvPageId>>;
 
+/// The core stores host and device indices in the same value type.
+fn host_value(pages: &[HostPageId]) -> PageValue<KvPageId> {
+    PageValue::from_vec(pages.iter().map(|page| KvPageId(page.0)).collect())
+}
+
+fn host_pages_of(value: &PageValue<KvPageId>) -> impl Iterator<Item = HostPageId> + '_ {
+    value.as_slice().iter().map(|page| HostPageId(page.0))
+}
+
 #[derive(Clone)]
 struct BeladyPages {
     oracle: BeladyOracle,
@@ -226,6 +348,8 @@ pub struct RadixCache {
     tree: SglangTree,
     belady: Option<BeladyPages>,
     pub page_pool: PagePool,
+    /// Present only in SGLang HiCache write_back mode.
+    host_pool: Option<HostPagePool>,
     page_size: usize,
 }
 
@@ -235,11 +359,16 @@ impl RadixCache {
             tree: self.tree.snapshot_full_device(),
             belady: self.belady.clone(),
             page_pool: self.page_pool.clone(),
+            host_pool: self.host_pool.clone(),
             page_size: self.page_size,
         }
     }
 
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
+        assert!(
+            self.host_pool.is_none(),
+            "Belady eviction is not modelled with SGLang HiCache write_back"
+        );
         assert_eq!(
             self.tree.evictable_size() + self.tree.protected_size(),
             0,
@@ -319,12 +448,31 @@ impl RadixCache {
         pages
     }
     pub fn new(total_tokens: usize, page_size: usize) -> Self {
+        Self::build(total_tokens, page_size, None)
+    }
+
+    /// Build a cache that offloads evicted device KV to a host pool of
+    /// `host_pages` pages, following SGLang HiCache's write_back policy:
+    /// a device leaf is copied to host when it is evicted, then demoted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new_write_back(total_tokens: usize, page_size: usize, host_pages: usize) -> Self {
+        Self::build(total_tokens, page_size, Some(HostPagePool::new(host_pages)))
+    }
+
+    fn build(total_tokens: usize, page_size: usize, host_pool: Option<HostPagePool>) -> Self {
         assert!(page_size >= 1, "page_size must be >= 1");
+        let write_back = host_pool.is_some();
         let tree = SglangTree::new(
             CacheInitParams {
                 // A request key already contains one hash per physical KV page.
                 page_size: 1,
                 eviction_policy: "lru".to_string(),
+                // write_back never fires write-through backups, so the
+                // threshold is unused. Core events stay off: the KV manager
+                // publishes events in AISimulate's own block-hash space.
+                is_write_back: write_back,
+                enable_hicache: write_back,
+                enable_kv_cache_events: false,
                 ..Default::default()
             },
             vec![FULL],
@@ -333,8 +481,14 @@ impl RadixCache {
             tree,
             belady: None,
             page_pool: PagePool::new(total_tokens, page_size),
+            host_pool,
             page_size,
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn host_pool(&self) -> Option<&HostPagePool> {
+        self.host_pool.as_ref()
     }
 
     pub fn root(&self) -> NodeId {
@@ -422,6 +576,11 @@ impl RadixCache {
             key: &key,
             namespace: KeyNamespaceRef::default(),
         });
+        // A Full-only match can only emit the split fix-up for a pending
+        // write-through ack, and write_back acks each backup inside the same
+        // `evict()` call. Under write_back the match may also end on host-only
+        // nodes (`host_hit_length`); this device-only path ignores them and
+        // locks the deepest device node, as SGLang does before load-back.
         assert!(
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
@@ -528,10 +687,13 @@ impl RadixCache {
             "SGLang core returned an incomplete canonical suffix"
         );
 
+        let (unretained_pages, unretained_host_pages) =
+            self.collect_unretained_pages(result.cache_actions);
         InsertPageResult {
             last_node,
             canonical_suffix,
-            unretained_pages: collect_unretained_pages(result.cache_actions),
+            unretained_pages,
+            unretained_host_pages,
         }
     }
 
@@ -587,45 +749,224 @@ impl RadixCache {
     /// Evict cache pages in SGLang LRU order.
     ///
     /// SGLang evicts complete compressed leaves, so this can release more than
-    /// the requested number of tokens.
-    pub fn evict(&mut self, num_tokens: usize) -> (usize, Vec<KvPageId>) {
+    /// the requested number of tokens. Under write_back, each victim is first
+    /// copied to the host pool and then demoted; see [`EvictionOutcome`].
+    pub fn evict(&mut self, num_tokens: usize) -> EvictionOutcome {
         let target_pages = num_tokens.div_ceil(self.page_size);
         if target_pages == 0 {
-            return (0, Vec::new());
+            return EvictionOutcome::default();
         }
         if self.belady.is_some() {
             let pages = self.evict_belady(target_pages);
             self.page_pool.free_pages(&pages);
-            return (pages.len() * self.page_size, pages);
+            return EvictionOutcome {
+                evicted_tokens: pages.len() * self.page_size,
+                device_pages: pages,
+                host_events: Vec::new(),
+            };
         }
 
+        let write_back = self.host_pool.is_some();
         let mut tracker = HashMap::from([(FULL, 0)]);
-        let mut evicted_pages = Vec::with_capacity(target_pages.min(self.tree.evictable_size()));
+        let mut outcome = EvictionOutcome {
+            device_pages: Vec::with_capacity(target_pages.min(self.tree.evictable_size())),
+            ..Default::default()
+        };
         self.tree.evict_device_start(FULL, target_pages);
+        // The core pops each candidate from its walk heap once, so a victim
+        // that stays device-resident is not offered again and the walk ends.
         loop {
             let (candidate, step) = self.tree.evict_device_next_node(FULL, &tracker);
-            absorb_eviction_step(&mut tracker, &mut evicted_pages, step);
+            self.absorb_eviction_step(Some(&mut tracker), &mut outcome, step);
             let Some(candidate) = candidate else {
                 break;
             };
 
             let (backup, step) = self
                 .tree
-                .evict_device_leaf(candidate, false)
+                .evict_device_leaf(candidate, write_back)
                 .expect("live eviction candidate");
-            assert!(
-                backup.is_none(),
-                "write-through eviction requested a backup"
-            );
-            absorb_eviction_step(&mut tracker, &mut evicted_pages, step);
+            self.absorb_eviction_step(Some(&mut tracker), &mut outcome, step);
+            if let Some(backup) = backup {
+                assert_eq!(
+                    backup.node_ids,
+                    [candidate],
+                    "write_back backs up the victim alone"
+                );
+                self.write_back_victim(candidate, &mut tracker, &mut outcome);
+            }
             if tracker.get(&FULL).copied().unwrap_or(0) >= target_pages {
                 break;
             }
         }
         self.tree.evict_device_end(FULL);
 
-        self.page_pool.free_pages(&evicted_pages);
-        (evicted_pages.len() * self.page_size, evicted_pages)
+        self.page_pool.free_pages(&outcome.device_pages);
+        outcome.evicted_tokens = outcome.device_pages.len() * self.page_size;
+        outcome
+    }
+
+    /// SGLang `_evict_components`: demote after a successful D->H backup,
+    /// otherwise drop the unbacked subtree. A declined drop (host-locked
+    /// subtree) leaves the victim device-resident until host space frees.
+    fn write_back_victim(
+        &mut self,
+        node: NodeId,
+        tracker: &mut HashMap<sglang_radix_tree::ComponentType, usize>,
+        outcome: &mut EvictionOutcome,
+    ) {
+        let step = if self.back_up_to_host(node, outcome) {
+            self.tree.demote(node).expect("backed-up D-leaf demotes")
+        } else {
+            let (_dropped, step) = self
+                .tree
+                .drop_subtree_no_host(node)
+                .expect("live eviction candidate");
+            step
+        };
+        // Demote and drop both count the device pages they free; a declined
+        // drop returns an empty step.
+        self.absorb_eviction_step(Some(tracker), outcome, step);
+    }
+
+    /// SGLang `_execute_and_commit_kv_backup(write_back=True)` followed by the
+    /// blocking `writing_check(write_back=True)`: the copy is acknowledged in
+    /// the same call, so no write-through stays pending.
+    fn back_up_to_host(&mut self, node: NodeId, outcome: &mut EvictionOutcome) -> bool {
+        let (device_value, comp_xfers) = self
+            .tree
+            .build_backup_spec(node)
+            .expect("live eviction candidate");
+        assert!(
+            comp_xfers.is_empty(),
+            "Full-only tree has no auxiliary backup transfers"
+        );
+        let device_pages = device_value.as_slice();
+        assert!(
+            !device_pages.is_empty(),
+            "write_back victim is already backed up"
+        );
+        let needed = device_pages.len();
+        let available = self.host_pool().expect("write_back").available_pages();
+        if available < needed {
+            let step = self.tree.drive_host_eviction(FULL, needed - available);
+            self.absorb_eviction_step(None, outcome, step);
+        }
+        let Some(host_pages) = self
+            .host_pool
+            .as_mut()
+            .expect("write_back")
+            .allocate_pages(needed)
+        else {
+            return false;
+        };
+
+        self.tree
+            .commit_backup(node, host_value(&host_pages), HashMap::new())
+            .expect("live eviction candidate");
+        let acked = self
+            .tree
+            .mark_write_through_pending(vec![node], node)
+            .expect("live eviction candidate");
+        self.tree
+            .finish_write_through(acked, node)
+            .expect("live eviction candidate");
+        outcome.host_events.extend(
+            host_pages
+                .into_iter()
+                .zip(device_pages.iter().copied())
+                .map(|(host, device)| HostPageEvent::Stored { host, device }),
+        );
+        true
+    }
+
+    /// Fold one core step into the eviction outcome. Device frees are returned
+    /// to the page pool by the caller; host frees go back to the host pool now,
+    /// so a later backup in the same call can reuse them.
+    fn absorb_eviction_step(
+        &mut self,
+        tracker: Option<&mut HashMap<sglang_radix_tree::ComponentType, usize>>,
+        outcome: &mut EvictionOutcome,
+        step: sglang_radix_tree::EvictionStepResult<PageValue<KvPageId>>,
+    ) {
+        if let Some(tracker) = tracker {
+            for (component, count) in step.tracker {
+                *tracker.entry(component).or_default() += count;
+            }
+        }
+        for (component, chunks) in step.device_frees {
+            assert_eq!(component, FULL, "Full-only tree evicted an auxiliary pool");
+            for chunk in chunks {
+                outcome.device_pages.extend_from_slice(chunk.as_slice());
+            }
+        }
+        if step.host_frees.is_empty() {
+            return;
+        }
+        let host_pool = self
+            .host_pool
+            .as_mut()
+            .expect("device-only simulation tree unexpectedly freed host pages");
+        for (component, chunks) in step.host_frees {
+            assert_eq!(component, FULL, "Full-only tree evicted an auxiliary pool");
+            for chunk in chunks {
+                let pages: Vec<_> = host_pages_of(&chunk).collect();
+                host_pool.free_pages(&pages);
+                outcome
+                    .host_events
+                    .extend(pages.into_iter().map(HostPageEvent::Freed));
+            }
+        }
+    }
+
+    /// Split insert actions into device and host pages the tree did not keep.
+    ///
+    /// On a Full-only tree the core emits only duplicate-page frees:
+    /// write-through backups never fire under write_back or without HiCache,
+    /// the split fix-up needs a write-through still pending between calls, and
+    /// host-slot frees come from SWA and Mamba components.
+    fn collect_unretained_pages(
+        &mut self,
+        actions: Vec<CacheAction<PageValue<KvPageId>>>,
+    ) -> (Vec<KvPageId>, Vec<HostPageId>) {
+        let mut pages = Vec::new();
+        let mut host_pages = Vec::new();
+        for action in actions {
+            match action {
+                CacheAction::FreeDeviceKV(chunks) | CacheAction::FreeDeviceKVFullOnly(chunks) => {
+                    for chunk in chunks {
+                        pages.extend_from_slice(chunk.as_slice());
+                    }
+                }
+                CacheAction::FreeComponentHostSlot {
+                    component_type,
+                    host_indices,
+                } if component_type == FULL => {
+                    let host_pool = self
+                        .host_pool
+                        .as_mut()
+                        .expect("device-only simulation tree freed host pages");
+                    for chunk in host_indices {
+                        let freed: Vec<_> = host_pages_of(&chunk).collect();
+                        host_pool.free_pages(&freed);
+                        host_pages.extend(freed);
+                    }
+                }
+                // write_back copies KV to host at eviction, never at insert.
+                CacheAction::BackupKV(_) if self.host_pool.is_some() => {}
+                CacheAction::BackupKV(_)
+                | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
+                | CacheAction::MambaEvictExcessPathStates { .. }
+                | CacheAction::FreeComponentDeviceSlot { .. }
+                | CacheAction::FreeComponentHostSlot { .. }
+                | CacheAction::RebuildFullToSwaMapping { .. }
+                | CacheAction::RecoverSwaWithLockedFull { .. }
+                | CacheAction::SwaRebuild { .. } => {
+                    panic!("Full-only simulation insert produced an unsupported cache action")
+                }
+            }
+        }
+        (pages, host_pages)
     }
 
     pub fn evictable_size(&self) -> usize {
@@ -664,50 +1005,6 @@ impl RadixCache {
             })
             .collect()
     }
-}
-
-fn collect_unretained_pages(actions: Vec<CacheAction<PageValue<KvPageId>>>) -> Vec<KvPageId> {
-    let mut pages = Vec::new();
-    for action in actions {
-        match action {
-            CacheAction::FreeDeviceKV(chunks) | CacheAction::FreeDeviceKVFullOnly(chunks) => {
-                for chunk in chunks {
-                    pages.extend_from_slice(chunk.as_slice());
-                }
-            }
-            CacheAction::BackupKV(_)
-            | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
-            | CacheAction::MambaEvictExcessPathStates { .. }
-            | CacheAction::FreeComponentDeviceSlot { .. }
-            | CacheAction::FreeComponentHostSlot { .. }
-            | CacheAction::RebuildFullToSwaMapping { .. }
-            | CacheAction::RecoverSwaWithLockedFull { .. }
-            | CacheAction::SwaRebuild { .. } => {
-                panic!("Full-only simulation insert produced an unsupported cache action")
-            }
-        }
-    }
-    pages
-}
-
-fn absorb_eviction_step(
-    tracker: &mut HashMap<sglang_radix_tree::ComponentType, usize>,
-    evicted_pages: &mut Vec<KvPageId>,
-    step: sglang_radix_tree::EvictionStepResult<PageValue<KvPageId>>,
-) {
-    for (component, count) in step.tracker {
-        *tracker.entry(component).or_default() += count;
-    }
-    for (component, chunks) in step.device_frees {
-        assert_eq!(component, FULL, "Full-only tree evicted an auxiliary pool");
-        for chunk in chunks {
-            evicted_pages.extend_from_slice(chunk.as_slice());
-        }
-    }
-    assert!(
-        step.host_frees.is_empty(),
-        "device-only simulation tree unexpectedly freed host pages"
-    );
 }
 
 #[cfg(test)]
@@ -754,8 +1051,11 @@ mod tests {
         cache.insert(&[3], &c);
         let snapshot = shared.then(|| cache.admission_checkpoint());
 
-        let (tokens, pages) = cache.evict(2);
-        assert_eq!((tokens, pages), (2, vec![KvPageId(1), KvPageId(2)]));
+        let outcome = cache.evict(2);
+        assert_eq!(
+            (outcome.evicted_tokens, outcome.device_pages),
+            (2, vec![KvPageId(1), KvPageId(2)])
+        );
         assert_eq!(cache.prefix_match_len(&[1, 2]), 1);
         assert_eq!(cache.prefix_match_len(&[3]), 0);
         assert_eq!(cache.available_tokens(), 2);
@@ -763,7 +1063,7 @@ mod tests {
             assert_eq!(saved.prefix_match_len(&[1, 2]), 2);
             assert_eq!(saved.prefix_match_len(&[3]), 1);
             assert_eq!(saved.available_tokens(), 0);
-            assert_eq!(saved.evict(2).1, vec![KvPageId(1), KvPageId(2)]);
+            assert_eq!(saved.evict(2).device_pages, vec![KvPageId(1), KvPageId(2)]);
         }
     }
 
@@ -779,7 +1079,7 @@ mod tests {
 
         // Another worker commits the first request; this worker must refresh its hidden key.
         oracle.retire_requests([Uuid::from_u128(1)]);
-        assert_eq!(cache.evict(1).1, vec![KvPageId(0)]);
+        assert_eq!(cache.evict(1).device_pages, vec![KvPageId(0)]);
         assert_eq!(cache.prefix_match_len(&[2]), 1);
     }
 
@@ -805,14 +1105,14 @@ mod tests {
         let other = cache.page_pool.allocate(1).unwrap();
         cache.insert(&[9], &other);
 
-        assert_eq!(cache.evict(2).1, vec![KvPageId(2), KvPageId(4)]);
+        assert_eq!(cache.evict(2).device_pages, vec![KvPageId(2), KvPageId(4)]);
         assert_eq!(cache.prefix_match_len(&[1, 2, 4]), 3);
         let (_, locked) = cache.match_prefix(&[1, 2]);
         cache.inc_lock_ref(locked);
-        assert_eq!(cache.evict(8).1, vec![KvPageId(3)]);
+        assert_eq!(cache.evict(8).device_pages, vec![KvPageId(3)]);
         assert_eq!(cache.protected_size(), 2);
         cache.dec_lock_ref(locked);
-        assert_eq!(cache.evict(2).1, vec![KvPageId(1), KvPageId(0)]);
+        assert_eq!(cache.evict(2).device_pages, vec![KvPageId(1), KvPageId(0)]);
         assert_eq!(cache.available_tokens(), 8);
     }
 
@@ -823,13 +1123,13 @@ mod tests {
         cache.set_belady_oracle(oracle);
         let first = cache.page_pool.allocate(1).unwrap();
         cache.insert(&[1], &first);
-        assert_eq!(cache.evict(1).1, vec![KvPageId(0)]);
+        assert_eq!(cache.evict(1).device_pages, vec![KvPageId(0)]);
         let reused = cache.page_pool.allocate(1).unwrap();
         assert_eq!(reused, first);
         cache.insert(&[2], &reused);
         let second = cache.page_pool.allocate(1).unwrap();
         cache.insert(&[3], &second);
-        assert_eq!(cache.evict(1).1, vec![KvPageId(1)]);
+        assert_eq!(cache.evict(1).device_pages, vec![KvPageId(1)]);
         assert_eq!(cache.prefix_match_len(&[2]), 1);
     }
 
@@ -842,7 +1142,7 @@ mod tests {
         let second = cache.page_pool.allocate(2).unwrap();
         cache.insert(&[2, 7], &second);
 
-        assert_eq!(cache.evict(2).1, vec![KvPageId(3), KvPageId(2)]);
+        assert_eq!(cache.evict(2).device_pages, vec![KvPageId(3), KvPageId(2)]);
         assert_eq!(cache.prefix_match_len(&[1, 7]), 2);
         assert_eq!(cache.prefix_match_len(&[2, 7]), 0);
     }
@@ -922,15 +1222,358 @@ mod tests {
         assert_eq!(cache.protected_size(), 8);
         assert_eq!(cache.evictable_size(), 4);
 
-        let (evicted, pages) = cache.evict(4);
-        assert_eq!(evicted, 4);
-        assert_eq!(pages, vec![KvPageId(2)]);
+        let outcome = cache.evict(4);
+        assert_eq!(outcome.evicted_tokens, 4);
+        assert_eq!(outcome.device_pages, vec![KvPageId(2)]);
+        assert!(outcome.host_events.is_empty());
         assert_eq!(cache.match_prefix(&[9, 10, 11, 12]).0, 0);
         assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
 
         cache.dec_lock_ref(locked);
         assert_eq!(cache.protected_size(), 0);
         assert_eq!(cache.evictable_size(), 8);
+    }
+
+    /// Insert like the KV manager: allocate request pages, insert from the root,
+    /// and return the pages the tree did not retain.
+    fn insert_pages(cache: &mut RadixCache, keys: &[LocalBlockHash]) -> Option<NodeId> {
+        let available = cache.page_pool.available_pages();
+        if available < keys.len() {
+            cache.evict((keys.len() - available) * cache.page_size());
+        }
+        let pages = cache.page_pool.allocate_pages(keys.len())?;
+        let result = cache.insert_page_hashes_from_node(cache.root(), 0, keys, &pages, false);
+        cache.page_pool.free_pages(&result.unretained_pages);
+        assert!(result.unretained_host_pages.is_empty());
+        Some(result.last_node)
+    }
+
+    fn keys(values: &[u64]) -> Vec<LocalBlockHash> {
+        values.iter().copied().map(LocalBlockHash).collect()
+    }
+
+    fn host_pages(cache: &RadixCache, node: NodeId) -> Option<Vec<HostPageId>> {
+        cache
+            .tree
+            .inspect_get_component_host_value(node, FULL)
+            .unwrap()
+            .map(|value| host_pages_of(&value).collect())
+    }
+
+    /// Every page is either free or held by exactly one tree node, on both tiers.
+    fn assert_pool_accounting(cache: &RadixCache) {
+        cache.tree.sanity_check(&[], &[]);
+        let mut device = Vec::new();
+        let mut host = Vec::new();
+        for node in cache.tree.inspect_get_all_node_ids() {
+            if let Some(value) = cache.tree.get_component_device_value(node, FULL).unwrap() {
+                device.extend_from_slice(value.as_slice());
+            }
+            if let Some(value) = cache
+                .tree
+                .inspect_get_component_host_value(node, FULL)
+                .unwrap()
+            {
+                host.extend(host_pages_of(&value));
+            }
+        }
+        assert_eq!(
+            device.len(),
+            cache.tree.evictable_size() + cache.tree.protected_size()
+        );
+        assert_eq!(
+            cache.page_pool.available_pages() + device.len(),
+            cache.page_pool.total_pages
+        );
+        device.sort_unstable();
+        device.dedup();
+        assert_eq!(
+            device.len(),
+            cache.tree.evictable_size() + cache.tree.protected_size()
+        );
+        let pool = cache.host_pool.as_ref().expect("write_back cache");
+        assert_eq!(pool.available_pages() + host.len(), pool.total_pages());
+        let held = host.len();
+        host.sort_unstable();
+        host.dedup();
+        assert_eq!(host.len(), held, "host page held twice");
+    }
+
+    #[test]
+    fn write_back_eviction_with_host_room_demotes_to_host() {
+        let mut cache = RadixCache::new_write_back(8, 2, 4);
+        let node = insert_pages(&mut cache, &keys(&[1, 2])).unwrap();
+        let device = cache.collect_path_pages(node);
+
+        let outcome = cache.evict(4);
+
+        assert_eq!(outcome.evicted_tokens, 4);
+        assert_eq!(outcome.device_pages, device);
+        let stored: Vec<_> = outcome.stored_host().collect();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().map(|&(_, page)| page).collect::<Vec<_>>(),
+            device
+        );
+        assert_eq!(outcome.host_frees().count(), 0);
+        assert_eq!(cache.available_tokens(), 8);
+        assert_eq!(cache.host_pool().unwrap().available_pages(), 2);
+        // The node stays in the tree as host-only.
+        assert_eq!(
+            host_pages(&cache, node),
+            Some(stored.iter().map(|&(host, _)| host).collect())
+        );
+        assert!(
+            cache
+                .tree
+                .get_component_device_value(node, FULL)
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.tree.inspect_is_host_evictable_leaf(node));
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn write_back_frees_host_lru_leaf_before_storing_a_new_victim() {
+        let mut cache = RadixCache::new_write_back(8, 1, 1);
+        let old = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        let new = insert_pages(&mut cache, &keys(&[2])).unwrap();
+        let outcome = cache.evict(1);
+        let old_host = host_pages(&cache, old).unwrap();
+        assert_eq!(outcome.stored_host().count(), 1);
+        assert_eq!(cache.host_pool().unwrap().available_pages(), 0);
+
+        let outcome = cache.evict(1);
+
+        assert_eq!(outcome.device_pages.len(), 1);
+        assert!(!cache.tree.inspect_contains_node(old));
+        assert_eq!(
+            outcome.host_events,
+            vec![
+                HostPageEvent::Freed(old_host[0]),
+                HostPageEvent::Stored {
+                    host: old_host[0],
+                    device: outcome.device_pages[0],
+                },
+            ]
+        );
+        assert_eq!(host_pages(&cache, new), Some(old_host));
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn write_back_drops_unbacked_leaf_when_host_room_cannot_be_made() {
+        let mut cache = RadixCache::new_write_back(8, 1, 1);
+        let pinned = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        cache.evict(1);
+        cache.tree.inc_host_lock_ref(pinned).unwrap();
+        let victim = insert_pages(&mut cache, &keys(&[2])).unwrap();
+        let victim_page = cache.collect_path_pages(victim);
+
+        let outcome = cache.evict(1);
+
+        assert_eq!(outcome.device_pages, victim_page);
+        assert!(outcome.host_events.is_empty());
+        assert!(!cache.tree.inspect_contains_node(victim));
+        assert!(host_pages(&cache, pinned).is_some());
+        assert_eq!(cache.host_pool().unwrap().available_pages(), 0);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn write_back_keeps_host_locked_subtree_device_resident() {
+        let mut cache = RadixCache::new_write_back(8, 1, 1);
+        let parent = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        let child = insert_pages(&mut cache, &keys(&[1, 2])).unwrap();
+        assert_ne!(parent, child);
+        // The child demotes into the only host page.
+        assert_eq!(cache.evict(1).stored_host().count(), 1);
+        cache.tree.inc_host_lock_ref(child).unwrap();
+
+        // The parent can neither be backed up (the host copy is locked) nor
+        // dropped (its subtree is host-locked), and eviction still terminates.
+        let outcome = cache.evict(8);
+
+        assert_eq!(outcome, EvictionOutcome::default());
+        assert_eq!(cache.collect_path_pages(parent).len(), 1);
+        assert!(host_pages(&cache, child).is_some());
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn match_after_demote_reports_no_device_hit() {
+        let mut cache = RadixCache::new_write_back(8, 2, 4);
+        let key = keys(&[1, 2]);
+        insert_pages(&mut cache, &key).unwrap();
+        cache.evict(4);
+
+        assert_eq!(cache.match_prefix_hashes(&key), (0, cache.root()));
+        let (matched, locked) = cache.match_prefix_hashes_and_lock(&key);
+        assert_eq!((matched, locked), (0, cache.root()));
+        cache.dec_lock_ref(locked);
+        assert_eq!(cache.prefix_match_hashes_len(&key), 0);
+        // The core already reports the host hit that load-back will consume.
+        let result = cache.tree.match_prefix(&MatchPrefixParams {
+            key: &PageKey::from(key.clone()),
+            namespace: KeyNamespaceRef::default(),
+        });
+        assert_eq!(result.host_hit_length, 2);
+        assert!(result.cache_actions.is_empty());
+        assert_pool_accounting(&cache);
+    }
+
+    /// U1: under write_back, host eviction first reclaims host copies whose node
+    /// is device-resident again, so a host free need not remove device KV.
+    #[test]
+    fn host_eviction_reclaims_coexisting_copy_and_keeps_device_value() {
+        let mut cache = RadixCache::new_write_back(8, 1, 1);
+        let key = keys(&[1]);
+        let node = insert_pages(&mut cache, &key).unwrap();
+        cache.evict(1);
+        let host = host_pages(&cache, node).unwrap();
+        // Re-inserting the prefix restores device KV next to the host copy.
+        assert_eq!(insert_pages(&mut cache, &key), Some(node));
+        let device = cache.collect_path_pages(node);
+        insert_pages(&mut cache, &keys(&[1, 2])).unwrap();
+
+        // Storing the [2] leaf needs the only host page, held by the node above it.
+        let outcome = cache.evict(1);
+
+        assert_eq!(outcome.host_events[0], HostPageEvent::Freed(host[0]));
+        assert!(matches!(
+            outcome.host_events[1],
+            HostPageEvent::Stored { host: page, .. } if page == host[0]
+        ));
+        assert_eq!(host_pages(&cache, node), None);
+        assert_eq!(cache.collect_path_pages(node), device);
+        assert_pool_accounting(&cache);
+    }
+
+    /// U2: `backuped()` follows the host value written by `commit_backup`; the
+    /// write-through ack pair only clears the pending mark it sets.
+    #[test]
+    fn commit_backup_alone_marks_node_backed_up() {
+        let mut cache = RadixCache::new_write_back(8, 1, 4);
+        let node = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        let host = cache.host_pool.as_mut().unwrap().allocate_pages(1).unwrap();
+
+        cache
+            .tree
+            .commit_backup(node, host_value(&host), HashMap::new())
+            .unwrap();
+
+        assert!(cache.tree.node_backuped(node).unwrap());
+        assert_eq!(
+            cache
+                .tree
+                .inspect_get_write_through_pending_id(node)
+                .unwrap(),
+            None
+        );
+        let ack = cache
+            .tree
+            .mark_write_through_pending(vec![node], node)
+            .unwrap();
+        assert_eq!(
+            cache
+                .tree
+                .inspect_get_write_through_pending_id(node)
+                .unwrap(),
+            Some(node)
+        );
+        cache.tree.finish_write_through(ack, node).unwrap();
+        assert_eq!(
+            cache
+                .tree
+                .inspect_get_write_through_pending_id(node)
+                .unwrap(),
+            None
+        );
+        assert!(cache.tree.node_backuped(node).unwrap());
+    }
+
+    #[test]
+    fn write_back_random_ops_keep_both_pools_balanced() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let mut cache = RadixCache::new_write_back(24, 2, 10);
+        let mut locked: Vec<NodeId> = Vec::new();
+        let mut inserted: Vec<Vec<LocalBlockHash>> = Vec::new();
+        let mut demotes = 0;
+        let mut host_frees = 0;
+        for _ in 0..1000 {
+            match rng.random_range(0..10) {
+                0..4 => {
+                    let len = rng.random_range(1..=5);
+                    let key: Vec<_> = (0..len)
+                        .map(|_| LocalBlockHash(rng.random_range(1..=3)))
+                        .collect();
+                    if insert_pages(&mut cache, &key).is_some() {
+                        inserted.push(key);
+                    }
+                }
+                4..6 if !inserted.is_empty() => {
+                    let key = &inserted[rng.random_range(0..inserted.len())];
+                    let prefix = rng.random_range(1..=key.len());
+                    let (_, node) = cache.match_prefix_hashes_and_lock(&key[..prefix]);
+                    locked.push(node);
+                }
+                6..8 if !locked.is_empty() => {
+                    let node = locked.swap_remove(rng.random_range(0..locked.len()));
+                    cache.dec_lock_ref(node);
+                }
+                _ => {
+                    let outcome = cache.evict(rng.random_range(1..=12));
+                    assert_eq!(
+                        outcome.evicted_tokens,
+                        outcome.device_pages.len() * cache.page_size()
+                    );
+                    for (_, device) in outcome.stored_host() {
+                        assert!(outcome.device_pages.contains(&device));
+                    }
+                    demotes += outcome.stored_host().count();
+                    host_frees += outcome.host_frees().count();
+                }
+            }
+            assert_pool_accounting(&cache);
+        }
+        assert!(
+            demotes > 0 && host_frees > 0,
+            "{demotes} demotes, {host_frees} host frees"
+        );
+
+        for node in locked.drain(..) {
+            cache.dec_lock_ref(node);
+        }
+        cache.evict(cache.total_tokens());
+        assert_eq!(cache.available_tokens(), cache.total_tokens());
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn host_page_pool_recycles_freed_pages() {
+        let mut pool = HostPagePool::new(3);
+        assert!(pool.allocate_pages(4).is_none());
+        let first = pool.allocate_pages(2).unwrap();
+        assert_eq!(first, vec![HostPageId(0), HostPageId(1)]);
+        assert_eq!(pool.available_pages(), 1);
+        pool.free_pages(&first[..1]);
+        assert_eq!(
+            pool.allocate_pages(2).unwrap(),
+            vec![HostPageId(0), HostPageId(2)]
+        );
+        assert_eq!(pool.available_pages(), 0);
+        assert!(pool.allocate_pages(1).is_none());
+        assert_eq!(pool.total_pages(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "never allocated")]
+    fn host_page_pool_rejects_foreign_pages() {
+        HostPagePool::new(2).free_pages(&[HostPageId(0)]);
     }
 
     #[test]

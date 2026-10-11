@@ -2997,7 +2997,7 @@ mod admission_validation_rollback {
                 );
             }
             let mut probe = cache.admission_checkpoint();
-            let eviction_order = probe.evict(probe.evictable_size()).1;
+            let eviction_order = probe.evict(probe.evictable_size()).device_pages;
             (nodes, eviction_order)
         };
         let state_before = radix_state(&core);
