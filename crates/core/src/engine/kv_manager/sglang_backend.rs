@@ -181,7 +181,14 @@ pub(crate) enum RequestAdmission {
     Admitted(AdmittedPrefix),
     /// Protected and free device capacity cannot hold the request. Pages
     /// may already have been evicted, as with a failed allocation.
-    NoRoom,
+    ///
+    /// `load` is a load-back that started before the suffix allocation
+    /// failed. A started H2D copy cannot be undone: its pages are counted in
+    /// [`SglangKvManager::take_h2d_pages`], and the caller must time it and
+    /// finish it like an admitted load. The request itself stays waiting.
+    NoRoom {
+        load: Option<Box<HostLoad>>,
+    },
     /// The request has a host hit to load but [`LoadBackGate::NoFreeSlot`]
     /// was given. Nothing changed: no lock, allocation, eviction or event.
     WaitForLoadSlot,
@@ -623,7 +630,7 @@ impl SglangKvManager {
                 prefix_len,
                 load: None,
             }) => Some(prefix_len),
-            RequestAdmission::NoRoom => None,
+            RequestAdmission::NoRoom { load: None } => None,
             admission => unreachable!("device-only allocation returned {admission:?}"),
         }
     }
@@ -706,7 +713,7 @@ impl SglangKvManager {
         let reservable = self.cache.available_tokens() + self.cache.evictable_size();
         if required_tokens > reservable {
             self.cache.dec_lock_ref(last_node);
-            return RequestAdmission::NoRoom;
+            return RequestAdmission::NoRoom { load: None };
         }
         // Without prefix caching, matching and the capacity check are read-only.
         if !self.enable_prefix_caching {
@@ -765,15 +772,11 @@ impl SglangKvManager {
 
         let available_before = self.cache.available_tokens();
         let Some(mut new_pages) = self.cache.page_pool.allocate_pages(required_pages) else {
-            // Only write_back eviction can fall short of the capacity check,
-            // when a host-locked subtree stays on device. A started load
-            // cannot be undone: complete it at once so the loaded pages stay
-            // cached and unpinned.
-            if let Some(load) = load {
-                self.cache.finish_load_back(load.handle);
-            }
+            // A started load cannot be undone: hand it back so the caller
+            // times its H2D copy and finishes it. Its in-flight lock keeps
+            // the loaded pages cached until then.
             self.cache.dec_lock_ref(last_node);
-            return RequestAdmission::NoRoom;
+            return RequestAdmission::NoRoom { load };
         };
         pages.append(&mut new_pages);
         let allocated_tokens = available_before - self.cache.available_tokens();
@@ -2890,6 +2893,62 @@ mod tests {
         }
     }
 
+    /// Host-lock the host-only continuation of `tokens`' device prefix.
+    fn host_lock_host_hit(mgr: &mut SglangKvManager, tokens: &[u32]) {
+        let mut lease = RadixRequestLease::default();
+        lease.ensure_page_hashes(tokens, 4);
+        let matched = mgr.match_prefix_with_host_and_lock(lease.page_hashes());
+        mgr.cache.dec_lock_ref(matched.last_node);
+        mgr.cache
+            .host_lock_hit_for_test(matched.host_hit.expect("a host hit"));
+    }
+
+    /// A load-back cannot be undone. If the suffix allocation then fails, the
+    /// admission hands the load back with `NoRoom`, so the scheduler still
+    /// times the counted H2D pages and finishes the load.
+    #[test]
+    fn failed_suffix_allocation_after_a_load_returns_the_load() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(20, 4, &sink);
+        let first = seq(1, 12);
+        cache_prompt(&mut mgr, &first);
+        cache_prompt(&mut mgr, &seq(500, 4));
+        let parent_and_child = seq(500, 8);
+        cache_prompt(&mut mgr, &parent_and_child);
+        // `first` and then the child page demote; the host is full.
+        mgr.evict(16);
+        assert_eq!(mgr.take_d2h_pages(), 4);
+        // The parent page stays device-resident under a host-locked child, a
+        // state production code never builds: write_back eviction keeps it.
+        host_lock_host_hit(&mut mgr, &parent_and_child);
+        let filler = seq(900, 4);
+        let filler_lease = mgr.allocate_for_request(&filler).unwrap().lease;
+
+        let mut prompt = first.clone();
+        prompt.push(13);
+        let (admission, lease) = admit(&mut mgr, &prompt, LoadBackGate::Allow);
+
+        let RequestAdmission::NoRoom { load: Some(load) } = admission else {
+            panic!("expected NoRoom with the started load, got {admission:?}");
+        };
+        assert_eq!((load.tokens, load.pages), (12, 3));
+        assert_eq!(mgr.take_h2d_pages(), load.pages);
+        assert!(!lease.is_active());
+        mgr.finish_load_back(load.handle);
+        mgr.abort(filler_lease);
+        assert_eq!(mgr.cache().protected_size(), 0);
+        // The loaded pages stay cached on device.
+        let (admission, lease) = admit(&mut mgr, &prompt, LoadBackGate::Allow);
+        let RequestAdmission::Admitted(AdmittedPrefix {
+            prefix_len: 12,
+            load: None,
+        }) = admission
+        else {
+            panic!("expected a device hit, got {admission:?}");
+        };
+        mgr.abort(lease);
+    }
+
     /// Insert-time host frees publish Removed{HostPinned} like eviction frees.
     #[test]
     fn insert_host_frees_publish_host_removed() {
@@ -2941,7 +3000,7 @@ mod tests {
         let too_long = seq(1, 20);
         assert!(matches!(
             mgr.admit_request_lease(&too_long, &mut lease, 19, LoadBackGate::Allow),
-            RequestAdmission::NoRoom
+            RequestAdmission::NoRoom { load: None }
         ));
         assert_eq!(mgr.cache().protected_size(), 0);
         assert_eq!((mgr.take_d2h_pages(), mgr.take_h2d_pages()), (0, 0));

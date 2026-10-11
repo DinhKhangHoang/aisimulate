@@ -160,7 +160,7 @@ pub(super) fn get_new_batch_prefill(
             // Continuation: extend the request's own pages; no re-match.
             kv_manager
                 .extend_allocation(alloc_tokens, &mut lease)
-                .map_or(RequestAdmission::NoRoom, |prefix_len| {
+                .map_or(RequestAdmission::NoRoom { load: None }, |prefix_len| {
                     RequestAdmission::Admitted(AdmittedPrefix {
                         prefix_len,
                         load: None,
@@ -189,9 +189,18 @@ pub(super) fn get_new_batch_prefill(
                 }
                 prefix_len
             }
-            // `NoRoom` is the old allocation failure. `WaitForLoadSlot` keeps the request
-            // waiting the same way; it cannot occur under `LoadBackGate::Allow`.
-            RequestAdmission::NoRoom | RequestAdmission::WaitForLoadSlot => {
+            // `NoRoom` is the old allocation failure; a load it started still runs, so the
+            // scheduler times it with this batch. `WaitForLoadSlot` keeps the request waiting the
+            // same way; it cannot occur under `LoadBackGate::Allow`.
+            RequestAdmission::NoRoom { load } => {
+                if let Some(load) = load {
+                    host_loads.push(*load);
+                }
+                req.kv_lease = lease;
+                rejected.push_back(req);
+                break;
+            }
+            RequestAdmission::WaitForLoadSlot => {
                 req.kv_lease = lease;
                 rejected.push_back(req);
                 break;

@@ -1125,17 +1125,30 @@ impl SglangCore {
         //   by layer (`h2d_done + prefill_ms / num_layers` would be the tight
         //   bound), but the scheduler does not know `num_layers`, so this
         //   overestimates by up to the overlap.
+        // - a load whose request was then refused (`RequestAdmission::NoRoom`)
+        //   still occupies the H2D lane, but only a prefill waits on loads.
         // Idle passes are not delayed: nothing waits on a copy without work.
         let decode_start_ms = match self.host_clock.as_mut() {
             Some(clock) if prefill_pass || decode_work => {
                 let start_ms = clock.compute_start(now_ms);
-                if load_pages > 0 {
-                    start_ms.max(clock.load(start_ms, load_pages)) + prefill_ms
+                let h2d_done_ms = if load_pages > 0 {
+                    clock.load(start_ms, load_pages)
+                } else {
+                    start_ms
+                };
+                if prefill_pass {
+                    start_ms.max(h2d_done_ms) + prefill_ms
                 } else {
                     start_ms + prefill_ms
                 }
             }
-            _ => now_ms + prefill_ms,
+            Some(clock) => {
+                if load_pages > 0 {
+                    clock.load(clock.compute_start(now_ms), load_pages);
+                }
+                now_ms + prefill_ms
+            }
+            None => now_ms + prefill_ms,
         };
         let decode = if prefill_pass {
             simulate_prefill_first_tokens(

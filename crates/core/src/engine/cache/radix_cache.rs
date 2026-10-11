@@ -903,6 +903,17 @@ impl RadixCache {
             .expect("live load-back anchor");
     }
 
+    /// Host-lock a host hit's anchor without loading it, leaving it
+    /// host-only. Production host locks come only from [`Self::load_back`],
+    /// which device-locks the same anchor; this builds the states the
+    /// manager cannot reach on its own.
+    #[cfg(test)]
+    pub(crate) fn host_lock_hit_for_test(&mut self, hit: HostHit) {
+        self.tree
+            .inc_host_lock_ref(hit.best_node)
+            .expect("live host anchor");
+    }
+
     fn release_load_back_locks(
         &mut self,
         anchor: NodeId,
