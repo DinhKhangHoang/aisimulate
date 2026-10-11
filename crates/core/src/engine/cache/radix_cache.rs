@@ -1745,6 +1745,50 @@ mod tests {
         assert_pool_accounting(&cache);
     }
 
+    /// The state above cannot arise without a test-only host lock. Every
+    /// production host lock comes from `load_back`, which device-locks the
+    /// same anchor once it is loaded, and a device lock reaches the root. So
+    /// a device page above a host-locked node is never an eviction candidate
+    /// nor counted in `evictable_size`, and eviction frees at least the
+    /// smaller of the target and `evictable_size`, as the capacity checks of
+    /// admission and prefill assume.
+    #[test]
+    fn host_locked_subtree_keeps_its_device_ancestors_out_of_evictable_size() {
+        let mut cache = RadixCache::new_write_back(20, 4, 3);
+        let parent = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        let child_key = keys(&[1, 2, 3, 4]);
+        let child = insert_pages(&mut cache, &child_key).unwrap();
+        insert_pages(&mut cache, &keys(&[9])).unwrap();
+        // The child demotes into all three host pages.
+        assert_eq!(cache.evict(12).stored_host().count(), 3);
+        let matched = cache.match_prefix_with_host_and_lock(&child_key);
+        assert_eq!((matched.device_tokens, matched.last_node), (4, parent));
+        let loaded = expect_loaded(cache.load_back(matched.host_hit.unwrap(), None));
+        assert_eq!(loaded.last_node, child);
+        cache.dec_lock_ref(loaded.last_node);
+
+        // The host is full and its only copy is locked by the in-flight
+        // load, but the locked node is device-resident and device-locked, so
+        // its parent is protected too: only the unrelated leaf is evictable.
+        assert_eq!(cache.host_pool().unwrap().available_pages(), 0);
+        assert!(host_pages(&cache, child).is_some());
+        assert_eq!(cache.collect_path_pages(child).len(), 4);
+        assert!(device_lock_ref(&cache, parent) > 0);
+        assert_eq!(cache.evictable_size(), 4);
+        let outcome = cache.evict(cache.total_tokens());
+        assert_eq!(outcome.evicted_tokens, 4, "the leaf is dropped");
+        assert!(outcome.host_events.is_empty());
+        assert_eq!(cache.evictable_size(), 0);
+
+        // Once the load finishes, all of it is evictable again and is freed.
+        cache.finish_load_back(loaded.handle);
+        let evictable = cache.evictable_size();
+        assert_eq!(evictable, 16);
+        assert_eq!(cache.evict(cache.total_tokens()).evicted_tokens, evictable);
+        assert_eq!(cache.available_tokens(), cache.total_tokens());
+        assert_pool_accounting(&cache);
+    }
+
     #[test]
     fn match_after_demote_reports_no_device_hit() {
         let mut cache = RadixCache::new_write_back(8, 2, 4);
@@ -1925,8 +1969,19 @@ mod tests {
                     finishes += 1;
                 }
                 _ => {
-                    let outcome = cache.evict(rng.random_range(1..=24));
+                    // Admission sizes its capacity check with `evictable_size`:
+                    // eviction must free at least the smaller of the two.
+                    let target = rng.random_range(1..=24);
+                    let evictable = cache.evictable_size();
+                    let outcome = cache.evict(target);
                     absorb(&outcome, cache.page_size());
+                    assert!(
+                        outcome.evicted_tokens
+                            >= (target.div_ceil(cache.page_size()) * cache.page_size())
+                                .min(evictable),
+                        "evicted {} of {target} with {evictable} evictable",
+                        outcome.evicted_tokens
+                    );
                 }
             }
             assert_pool_accounting_with_loads(&cache, &pending.iter().collect::<Vec<_>>());
