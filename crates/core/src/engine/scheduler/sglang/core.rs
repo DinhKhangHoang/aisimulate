@@ -1215,6 +1215,19 @@ impl SglangCore {
         for request in decode.completed_requests.drain(..) {
             self.complete_source(request);
         }
+        // `FINISH_ABORT` from `retract_decode`: the request ends with an error, KV already freed.
+        for request in decode.aborted_requests.drain(..) {
+            self.active_request_ids.remove(&request.uuid);
+            self.source_holds.remove_request(request.uuid);
+            decode.output_signals.push(OutputSignal {
+                uuid: request.uuid,
+                token_id: None,
+                completed: true,
+                rejected: true,
+                cached_tokens: None,
+                handoff_delay_ms: None,
+            });
+        }
         if let Some(oracle) = &self.belady {
             oracle.retire_requests(rejected.iter().map(|(_, request)| request.uuid));
         }

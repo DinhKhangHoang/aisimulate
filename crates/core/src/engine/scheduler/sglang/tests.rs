@@ -525,6 +525,83 @@ fn committed_decode_membership_excludes_retracted_requests() {
 }
 
 #[test]
+fn last_decode_request_is_aborted_when_a_parked_chunk_holds_the_pool() {
+    // SGLang `retract_decode` aborts the last decode request when it cannot fit even after the
+    // others were retracted. Here a chunked prefill parked at the head of `waiting` holds every
+    // page the decoding request does not, so neither can grow without the abort.
+    let mut core = SglangCore::new(test_args(6, 4, 16));
+    let decoding = Uuid::from_u128(90_020);
+    let chunked = Uuid::from_u128(90_021);
+    core.receive(DirectRequest {
+        uuid: Some(decoding),
+        ..direct_request(vec![1, 2, 3, 4, 5, 6, 7], 4)
+    });
+    core.waiting.pop_front().unwrap();
+    let tokens = vec![1, 2, 3, 4, 5, 6, 7, 10];
+    let allocation = core.kv_manager.allocate_for_request(&tokens).unwrap();
+    core.running.push(SglangRequest {
+        is_decode_handoff: false,
+        uuid: decoding,
+        sequence_tokens: tokens,
+        prompt_len: 7,
+        max_output_tokens: 4,
+        planned_output_ids: None,
+        kv_lease: allocation.lease,
+        materialized_tokens: 8,
+        allocated_tokens: 8,
+        first_admission_recorded: false,
+    });
+
+    let chunk_len = core.kv_manager.cache().available_tokens();
+    assert!(chunk_len > 0);
+    let prompt: Vec<u32> = (100..100 + chunk_len as u32 + 4).collect();
+    core.receive(DirectRequest {
+        uuid: Some(chunked),
+        ..direct_request(prompt.clone(), 1)
+    });
+    core.waiting.pop_front().unwrap();
+    let allocation = core
+        .kv_manager
+        .allocate_for_request(&prompt[..chunk_len])
+        .unwrap();
+    core.waiting.push_front(SglangRequest {
+        is_decode_handoff: false,
+        uuid: chunked,
+        sequence_tokens: prompt.clone(),
+        prompt_len: prompt.len(),
+        max_output_tokens: 1,
+        planned_output_ids: None,
+        kv_lease: allocation.lease,
+        materialized_tokens: chunk_len,
+        allocated_tokens: chunk_len,
+        first_admission_recorded: true,
+    });
+    assert_eq!(core.kv_manager.cache().available_tokens(), 0);
+    assert_eq!(core.kv_manager.cache().evictable_size(), 0);
+
+    let pass = core.execute_hidden_pass(0.0);
+    let aborted: Vec<_> = pass
+        .output_signals
+        .iter()
+        .filter(|signal| signal.uuid == decoding)
+        .collect();
+    let [signal] = aborted.as_slice() else {
+        panic!("expected one terminal signal for the aborted request, got {aborted:?}");
+    };
+    assert!(signal.completed && signal.rejected && signal.token_id.is_none());
+    assert!(core.running.is_empty());
+    assert_eq!(core.kv_manager.cache().available_tokens(), 8);
+
+    // The freed pages let the parked chunk finish its prefill.
+    let pass = core.execute_hidden_pass(1.0);
+    assert!(
+        pass.output_signals
+            .iter()
+            .any(|signal| signal.uuid == chunked && signal.completed && !signal.rejected)
+    );
+}
+
+#[test]
 fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
     let args = test_args(8, 4, 16);
     let config = SglangConfig::from_args(&args);

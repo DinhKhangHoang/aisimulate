@@ -22,6 +22,9 @@ pub(super) const RETRACT_DECODE_STEPS: usize = 20;
 pub(super) struct DecodeResult {
     pub(super) requests: Vec<SglangRequest>,
     pub(super) completed_requests: Vec<SglangRequest>,
+    /// Requests that SGLang `ScheduleBatch.retract_decode` aborts (`FINISH_ABORT`) because even
+    /// the last one cannot fit after the others were retracted. Their KV is already released.
+    pub(super) aborted_requests: Vec<SglangRequest>,
     pub(super) output_signals: Vec<OutputSignal>,
     pub(super) pressure_events: Vec<PressureEvent>,
     /// SGLang `ScheduleBatch.retract_decode` re-estimate of `new_token_ratio`, computed from the
@@ -124,6 +127,7 @@ pub(super) fn check_decode_mem_with_pressure_events(
     at_ms: f64,
 ) -> (Vec<SglangRequest>, Vec<PressureEvent>) {
     let mut pressure_events = Vec::new();
+    let mut aborted = Vec::new();
     let requests = check_decode_mem_for_burst(
         running,
         kv_manager,
@@ -131,7 +135,9 @@ pub(super) fn check_decode_mem_with_pressure_events(
         max_burst,
         at_ms,
         &mut pressure_events,
+        Some(&mut aborted),
     );
+    assert!(aborted.is_empty(), "unexpected SGLang decode abort");
     (requests, pressure_events)
 }
 
@@ -142,6 +148,7 @@ fn check_decode_mem_for_burst(
     max_burst: usize,
     at_ms: f64,
     pressure_events: &mut Vec<PressureEvent>,
+    aborted: Option<&mut Vec<SglangRequest>>,
 ) -> Vec<SglangRequest> {
     let mut retracted = Vec::new();
 
@@ -190,6 +197,25 @@ fn check_decode_mem_for_burst(
     let page_growth_needed = decode_page_growth_needed(running, config.block_size, max_burst);
     if available < page_growth_needed {
         kv_manager.evict(page_growth_needed - available);
+    }
+
+    // SGLang `retract_decode`: when even the last request does not fit after the others were
+    // retracted and the tree cache evicted (another request, e.g. a chunked prefill, holds the
+    // rest of the pool), it is aborted and its KV released without inserting into the tree.
+    // Keeping it would leave a decode step that can never allocate.
+    if let Some(aborted) = aborted
+        && running.len() == 1
+        && kv_manager.cache().available_tokens()
+            < decode_page_growth_needed(running, config.block_size, max_burst)
+    {
+        let mut req = running.pop().expect("one running request");
+        kv_manager.retract_in_place(&mut req.kv_lease);
+        tracing::warn!(
+            request_id = %req.uuid,
+            "SGLang decode aborted the last request: out of memory even after retracting all \
+             other requests"
+        );
+        aborted.push(req);
     }
 
     if !retracted.is_empty() {
@@ -465,6 +491,7 @@ fn simulate_step(
         config.speculative_max_tokens.unwrap_or(1)
     };
     let mut pressure_events = Vec::new();
+    let mut aborted_requests = Vec::new();
     let retracted = check_decode_mem_for_burst(
         running,
         kv_manager,
@@ -472,6 +499,11 @@ fn simulate_step(
         max_burst,
         current_time_ms,
         &mut pressure_events,
+        // Requests completing in this pass free their KV only after it; SGLang would already
+        // have released it, so the survivor retries next pass instead of being aborted.
+        completed_requests
+            .is_empty()
+            .then_some(&mut aborted_requests),
     );
     // SGLang re-estimates the ratio in `retract_decode`, i.e. from the survivors before the
     // forward that follows, not from their state after this pass's tokens were appended.
@@ -480,6 +512,7 @@ fn simulate_step(
     if running.is_empty() {
         return Ok(DecodeResult {
             completed_requests,
+            aborted_requests,
             output_signals,
             requests: retracted,
             pressure_events,
@@ -488,6 +521,7 @@ fn simulate_step(
             ..DecodeResult::default()
         });
     }
+    debug_assert!(aborted_requests.is_empty());
 
     let total_context: usize = running
         .iter()
@@ -596,6 +630,7 @@ fn simulate_step(
     Ok(DecodeResult {
         requests: retracted,
         completed_requests,
+        aborted_requests,
         output_signals,
         pressure_events,
         new_token_ratio_estimate,
