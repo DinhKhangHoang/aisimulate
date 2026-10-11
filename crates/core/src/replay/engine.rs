@@ -672,9 +672,12 @@ mod observation_tests {
     /// hashes, total events).
     type Ingested = Arc<Mutex<Vec<(f64, Vec<u64>, Vec<u64>, usize)>>>;
 
-    /// Places request 1 on worker 0 and holds request 2 until an ingested
-    /// batch carries a host-pinned store, then places it on worker 1.
+    /// Places requests numbered below `held_from` on worker 0 and holds the
+    /// next one until an ingested batch carries a host-pinned store, then
+    /// places it on worker `release_to`.
     struct PlaceAfterHostCopy {
+        held_from: u128,
+        release_to: usize,
         held: Option<Uuid>,
         ingested: Ingested,
     }
@@ -701,7 +704,7 @@ mod observation_tests {
             _: f64,
         ) -> anyhow::Result<PlacementEffects> {
             let request_id = request.metadata().uuid.unwrap();
-            let decision = if request_id == Uuid::from_u128(1) {
+            let decision = if request_id.as_u128() < self.held_from {
                 PlacementDecision::Immediate(placement(request_id, 0))
             } else {
                 assert!(self.held.replace(request_id).is_none());
@@ -737,7 +740,10 @@ mod observation_tests {
                     batch.0.len(),
                 ));
             }
-            Ok(released.map(|id| placement(id, 1)).into_iter().collect())
+            Ok(released
+                .map(|id| placement(id, self.release_to))
+                .into_iter()
+                .collect())
         }
 
         fn cancel_pending(&mut self, request_id: Uuid) -> bool {
@@ -808,6 +814,8 @@ mod observation_tests {
             .collect();
         let ingested = Ingested::default();
         let policy = PlaceAfterHostCopy {
+            held_from: 2,
+            release_to: 1,
             held: None,
             ingested: Arc::clone(&ingested),
         };
@@ -852,5 +860,100 @@ mod observation_tests {
                 (3.0, vec![hash], vec![], 1),
             ]
         );
+    }
+
+    #[test]
+    fn aggregated_sglang_replay_ingests_write_back_host_pinned_stores() {
+        // SGLang HiCache write_back keeps a private host cache per DP rank, so
+        // the host copy is made by device eviction on the same worker.
+        let config = ReplayEngineConfig {
+            rank: EngineConfig {
+                num_gpu_blocks: 5,
+                block_size: 4,
+                kv_cache_bytes_per_token: Some(250_000),
+                native_host_offload: Some(
+                    NativeHostOffloadConfig::new(8).with_bandwidths(1.0, 1.0),
+                ),
+                timing_model: TimingModelConfig::Fixed {
+                    prefill_ms: 1.0,
+                    decode_ms: 0.0,
+                },
+                ..EngineConfig::for_backend(crate::engine::Backend::Sglang)
+            },
+            ..Default::default()
+        };
+        let factory = ReplayEngineFactory::new()
+            .role_factory(&config, WorkerStage::Aggregated, true)
+            .unwrap();
+        // Each 13-token prompt needs four of the five device pages (SGLang
+        // admits only below capacity, so four pages would never admit one).
+        // Request 2 evicts request 1's cached three-page radix node, which
+        // write_back demotes to host whole. Request 3 repeats request 1.
+        let prompt = |first: u32| (first..first + 13).collect::<Vec<_>>();
+        let requests = [
+            (1, 0.0, prompt(1)),
+            (2, 0.5, prompt(100)),
+            (3, 0.5, prompt(1)),
+        ]
+        .into_iter()
+        .map(|(id, arrival_ms, tokens)| DirectRequest {
+            tokens,
+            max_output_tokens: 1,
+            uuid: Some(Uuid::from_u128(id)),
+            arrival_timestamp_ms: Some(arrival_ms),
+            ..Default::default()
+        })
+        .collect();
+        let ingested = Ingested::default();
+        let policy = PlaceAfterHostCopy {
+            held_from: 3,
+            release_to: 0,
+            held: None,
+            ingested: Arc::clone(&ingested),
+        };
+        let report = AggRuntimeImpl::<_, KvEventObservation, NoReplayMetadata>::new_composed(
+            factory,
+            AdmissionQueue::new_requests(requests, ReplayMode::Trace),
+            1,
+            None,
+            |_, _| Ok(policy),
+        )
+        .unwrap()
+        .with_per_request_records(true)
+        .run()
+        .unwrap()
+        .0
+        .finish();
+
+        assert_eq!(report.request_counts.completed_requests, 3);
+        // Request 3 loads the 12-token host hit back instead of recomputing
+        // it; the other two prompts are cold.
+        let mut reused = report
+            .per_request
+            .iter()
+            .map(|row| row.reused_input_tokens)
+            .collect::<Vec<_>>();
+        reused.sort_unstable();
+        assert_eq!(reused, [0, 0, 12]);
+        let ingested = ingested.lock().unwrap();
+        let first_prompt = ingested[0].1.clone();
+        assert_eq!(first_prompt.len(), 3);
+        // Host-pinned stores are ingested but are not router-visible device
+        // residency; the demoted pages are request 1's.
+        let host_batch = ingested
+            .iter()
+            .find(|(_, _, host_pinned, _)| !host_pinned.is_empty())
+            .unwrap();
+        assert_eq!(host_batch.2, first_prompt);
+        assert!(host_batch.1.iter().all(|hash| !first_prompt.contains(hash)));
+        // The load-back makes request 1's pages device-resident again.
+        let reloaded = ingested
+            .iter()
+            .skip_while(|batch| !std::ptr::eq(*batch, host_batch))
+            .skip(1)
+            .flat_map(|(_, device, _, _)| device)
+            .filter(|hash| first_prompt.contains(hash))
+            .count();
+        assert_eq!(reloaded, 3, "{ingested:?}");
     }
 }

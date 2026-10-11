@@ -4,16 +4,17 @@
 //! Replay-level G2 ownership: private per DP rank or one cluster-shared pool
 //! across ranks, replicas and P/D roles.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use aisimulate_core::engine::generalized::{EngineIdentity, SchedulerCommand};
 use aisimulate_core::engine::{
-    Admission, Command, Engine, EngineConfig, EngineFactory, KvEventData, KvEventTier, Request,
-    SharedG2Pool,
+    Admission, Command, Engine, EngineConfig, EngineFactory, KvEvent, KvEventData, KvEventTier,
+    Request, SharedG2Pool,
 };
 use aisimulate_core::replay::{
-    G2DomainStats, ReplayCaptureOptions, ReplayDeterminism, ReplayEngineFactory, ReplayReport,
-    ReplaySpec, Replayer,
+    G2DomainStats, ReplayArtifactKvEventVisibility, ReplayCaptureOptions, ReplayDeterminism,
+    ReplayEngineFactory, ReplayReport, ReplaySpec, Replayer,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -598,4 +599,120 @@ fn an_engine_joining_a_warm_shared_pool_publishes_its_residency() {
     assert_eq!(host_pinned_blocks, 2);
     assert!(consumer.next_internal_deadline_ms().is_none());
     assert!(consumer.is_drained());
+}
+
+/// Replay one SGLang HiCache write_back worker and return the report with the
+/// worker's native KV events.
+fn run_sglang_with_events(
+    num_gpu_blocks: u32,
+    num_host_blocks: usize,
+    requests: Vec<Value>,
+) -> (ReplayReport, Vec<KvEvent>) {
+    let mut rank = rank(host("dp_rank_local"));
+    rank["backend"] = json!("sglang");
+    rank["num_gpu_blocks"] = json!(num_gpu_blocks);
+    rank["native_host_offload"]["num_host_blocks"] = json!(num_host_blocks);
+    let spec: ReplaySpec = serde_json::from_value(json!({
+        "version": 1, "topology": aggregated(1), "engine": {"rank": rank},
+        "requests": requests, "record_per_request": true,
+    }))
+    .unwrap();
+    let (report, artifacts) = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .with_capture_options(ReplayCaptureOptions {
+            determinism: ReplayDeterminism::CanonicalV1,
+            ..ReplayCaptureOptions::default()
+        })
+        .run_with_artifacts(ReplayArtifactKvEventVisibility::Native)
+        .unwrap();
+    let events = artifacts.kv_events.into_iter().map(|e| e.event).collect();
+    (report, events)
+}
+
+/// Replays HostPinned events through a per-rank host ledger. Returns the
+/// (stored, removed) block counts and the blocks still host-resident at the
+/// end. Panics on a Removed without an earlier Stored, which would leave a
+/// router's host_cache_hit_weight credit pointing at a dropped block, and on
+/// a Stored for a block the ledger already holds.
+fn host_pinned_ledger(events: &[KvEvent]) -> (usize, usize, BTreeSet<(u32, u64)>) {
+    let (mut stored, mut removed) = (0, 0);
+    let mut resident = BTreeSet::new();
+    for event in events
+        .iter()
+        .filter(|event| event.tier == KvEventTier::HostPinned)
+    {
+        match &event.data {
+            KvEventData::Stored(blocks) => {
+                for block in &blocks.blocks {
+                    stored += 1;
+                    assert!(
+                        resident.insert((event.dp_rank, block.block_hash)),
+                        "event {}: duplicate HostPinned store of {:#x}",
+                        event.event_id,
+                        block.block_hash
+                    );
+                }
+            }
+            KvEventData::Removed { block_hashes } => {
+                for hash in block_hashes {
+                    removed += 1;
+                    assert!(
+                        resident.remove(&(event.dp_rank, *hash)),
+                        "event {}: HostPinned removal of {hash:#x} was never stored",
+                        event.event_id
+                    );
+                }
+            }
+        }
+    }
+    (stored, removed, resident)
+}
+
+#[test]
+fn sglang_write_back_host_pinned_events_balance_under_host_pressure() {
+    // 16-token prompts are four 4-token pages. Ten distinct prompts on a
+    // 16-page GPU and an 8-page host force device eviction (HostPinned
+    // stores) and then host eviction (HostPinned removals). Revisiting
+    // earlier prompts exercises load-back from the host.
+    let order = [0, 1, 2, 3, 4, 0, 5, 6, 1, 7, 8, 9, 2, 0, 5, 3];
+    let requests = order
+        .iter()
+        .enumerate()
+        .map(|(index, &prompt)| {
+            let first = 1_000 * (prompt + 1);
+            json!({
+                "id": format!("r{index:02}"), "arrival_time_ms": 100.0 * index as f64,
+                "input_tokens": 16, "input_token_ids": (first..first + 16).collect::<Vec<u32>>(),
+                "output_tokens": 2,
+            })
+        })
+        .collect();
+    let (report, events) = run_sglang_with_events(16, 8, requests);
+    assert_eq!(report.request_counts.completed_requests, order.len());
+
+    let (stored, removed, resident) = host_pinned_ledger(&events);
+    assert!(stored > 0, "device eviction must store to host");
+    assert!(removed > 0, "host pressure must remove from host");
+    assert_eq!(stored - removed, resident.len());
+    assert!(resident.len() <= 8, "the host holds at most 8 pages");
+    // Revisited prompts restore from host instead of recomputing.
+    // r04 demoted prompt 0 to host. Its revisit r05 loads back the three
+    // full pages before the last prompt token (12 >= SGLang's 10-token
+    // threshold); later revisits find their pages already dropped from host.
+    let reused = report
+        .per_request
+        .iter()
+        .map(|record| {
+            (
+                record.request_id.clone().unwrap(),
+                record.reused_input_tokens,
+            )
+        })
+        .filter(|(_, reused)| *reused > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(reused, [("r05".to_string(), 12)]);
+    // SGLang admissions do not yet split reuse by tier.
+    assert_eq!(host_reuse(&report), [None; 16]);
+    // The run is deterministic; pin the event balance.
+    assert_eq!((stored, removed, resident.len()), (52, 44, 8));
 }
