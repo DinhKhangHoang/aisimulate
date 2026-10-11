@@ -3565,6 +3565,49 @@ mod hicache_write_back {
         assert_no_pinned_load_backs(&mut limited);
     }
 
+    /// Prefill sizes the chunk around the host hit before the load-back. If the
+    /// load is then refused, the chunk and the budgets are recomputed from the
+    /// prefix actually admitted, as SGLang 0.5.18 `add_one_req` does after
+    /// `init_load_back`: input over the chunk budget is truncated, not
+    /// computed in one pass.
+    #[test]
+    fn refused_load_back_truncates_the_chunk_to_the_budget() {
+        let mut core = core(Some((0.0, 0.0)));
+        core.config.chunked_prefill_size = 16;
+        let a = run(&mut core, prompt_a(), 0.0);
+        let b = run(&mut core, prompt_b(), a.end_ms);
+        // The estimate counts 7 host pages, so only 4 tokens fit the chunk.
+        let mut page_hashes =
+            crate::engine::kv_manager::sglang_backend::RadixRequestLease::default();
+        page_hashes.ensure_page_hashes(&prompt_a(), PAGE);
+        assert_eq!(
+            core.kv_manager
+                .reusable_prefix_with_host(&page_hashes.page_hashes()[..7]),
+            28
+        );
+
+        core.kv_manager.refuse_next_load_back_for_test();
+        let uuid = core.receive(direct_request(prompt_a(), 1));
+        let pass = core.execute_hidden_pass(b.end_ms);
+        core.complete_engine_boundary(pass.end_ms);
+
+        let admission = pass.admissions.iter().find(|a| a.uuid == uuid).unwrap();
+        assert_eq!(admission.reused_input_tokens, 0);
+        // 16 of 32 tokens at 1 ms per token; the rest is the next chunk.
+        assert_eq!(pass.end_ms - b.end_ms, 16.0);
+        assert_eq!(core.host_transfer_pages().1, 0, "nothing was loaded");
+        let mut now = pass.end_ms;
+        let mut passes = 1;
+        while !core.is_empty() {
+            let pass = core.execute_hidden_pass(now);
+            core.complete_engine_boundary(pass.end_ms);
+            now = pass.end_ms;
+            passes += 1;
+        }
+        assert_eq!((passes, now - b.end_ms), (2, 32.0));
+        assert_no_pinned_load_backs(&mut core);
+    }
+
     #[test]
     fn write_back_eviction_stalls_the_pass_that_triggered_it() {
         let mut unlimited = core(Some((0.0, 0.0)));

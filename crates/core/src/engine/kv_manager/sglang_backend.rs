@@ -5,8 +5,10 @@
 //! operations and KV event publishing.
 
 use crate::engine::belady::BeladyOracle;
+#[cfg(test)]
+use crate::engine::cache::radix_cache::LoadBackRefusal;
 use crate::engine::cache::radix_cache::{
-    EvictionOutcome, HostPageEvent, HostPageId, KvPageId, LOAD_BACK_THRESHOLD_TOKENS,
+    EvictionOutcome, HostHit, HostPageEvent, HostPageId, KvPageId, LOAD_BACK_THRESHOLD_TOKENS,
     LoadBackHandle, LoadBackResult, LoadedBack, NodeId, PrefixMatch, RadixCache,
 };
 use crate::engine::common::hashing::{
@@ -259,6 +261,10 @@ pub struct SglangKvManager {
     d2h_pages: usize,
     /// Host pages loaded to device since the last [`Self::take_h2d_pages`].
     h2d_pages: usize,
+    /// Refuse the next load-back, as `RadixCache::load_back` does for a hit
+    /// that another load pins or that has no device room.
+    #[cfg(test)]
+    refuse_next_load_back: bool,
 }
 
 #[must_use = "admission must be committed or rolled back"]
@@ -457,7 +463,28 @@ impl SglangKvManager {
             host_page_identity,
             d2h_pages: 0,
             h2d_pages: 0,
+            #[cfg(test)]
+            refuse_next_load_back: false,
         }
+    }
+
+    /// Make the next load-back refuse after the host hit was sized, a case
+    /// admission cannot reach today because nothing changes the tree
+    /// between prefill's estimate and the load.
+    #[cfg(test)]
+    pub(crate) fn refuse_next_load_back_for_test(&mut self) {
+        self.refuse_next_load_back = true;
+    }
+
+    fn load_back(&mut self, hit: HostHit) -> LoadBackResult {
+        #[cfg(test)]
+        if std::mem::take(&mut self.refuse_next_load_back) {
+            return LoadBackResult::Refused {
+                reason: LoadBackRefusal::NoDeviceRoom,
+                eviction: EvictionOutcome::default(),
+            };
+        }
+        self.cache.load_back(hit, None)
     }
 
     /// Whether evicted device KV is written back to an SGLang HiCache host pool.
@@ -625,7 +652,8 @@ impl SglangKvManager {
         lease: &mut RadixRequestLease,
         max_prefix_tokens: usize,
     ) -> Option<usize> {
-        match self.allocate_lease(token_ids, lease, max_prefix_tokens, None) {
+        let len = token_ids.len();
+        match self.allocate_lease(token_ids, lease, max_prefix_tokens, None, |_| len) {
             RequestAdmission::Admitted(AdmittedPrefix {
                 prefix_len,
                 load: None,
@@ -649,14 +677,20 @@ impl SglangKvManager {
     /// - The capacity check runs before any load, so a load never starts for a
     ///   request that cannot fit; the loaded pages are part of the request's
     ///   required pages either way.
+    /// - `fit` gets the cached prefix once any load has run and returns the
+    ///   end of the tokens to allocate now, at most `token_ids.len()` and not
+    ///   below the prefix. A caller that sized `token_ids` around a host hit
+    ///   re-sizes its chunk with it if the load was refused (SGLang
+    ///   `add_one_req` recomputes `input_tokens` after `init_load_back`).
     pub(crate) fn admit_request_lease(
         &mut self,
         token_ids: &[u32],
         lease: &mut RadixRequestLease,
         max_prefix_tokens: usize,
         gate: LoadBackGate,
+        fit: impl FnOnce(usize) -> usize,
     ) -> RequestAdmission {
-        self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate))
+        self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate), fit)
     }
 
     /// Prefix a waiting request can reuse under SGLang HiCache write_back:
@@ -682,12 +716,14 @@ impl SglangKvManager {
     }
 
     /// `gate` is `None` for the device-only path, which ignores host hits.
+    /// See [`Self::admit_request_lease`] for `fit`.
     fn allocate_lease(
         &mut self,
         token_ids: &[u32],
         lease: &mut RadixRequestLease,
         max_prefix_tokens: usize,
         gate: Option<LoadBackGate>,
+        fit: impl FnOnce(usize) -> usize,
     ) -> RequestAdmission {
         assert!(!lease.is_active(), "request KV lease is already active");
         debug_assert!(lease.pages.is_empty(), "inactive KV lease retains pages");
@@ -729,7 +765,7 @@ impl SglangKvManager {
                 }
                 // `load_back` would refuse it as below the threshold.
                 LoadBackGate::NoFreeSlot => {}
-                LoadBackGate::Allow => match self.cache.load_back(hit, None) {
+                LoadBackGate::Allow => match self.load_back(hit) {
                     LoadBackResult::Loaded(loaded) => {
                         let LoadedBack {
                             pages: loaded_pages,
@@ -761,6 +797,18 @@ impl SglangKvManager {
                 },
             }
         }
+
+        // The capacity check above covered all of `token_ids`; the fitted
+        // end never passes it.
+        let end = fit(prefix_len);
+        assert!(
+            prefix_len <= end && end <= token_ids.len(),
+            "fitted end {end} outside {prefix_len}..={}",
+            token_ids.len()
+        );
+        let token_ids = &token_ids[..end];
+        let materialized_hashes = &materialized_hashes[..end / page_size];
+        let total_pages = end.div_ceil(page_size);
 
         let required_pages = total_pages - prefix_len / page_size;
         let required_tokens = required_pages * page_size;
@@ -2557,7 +2605,8 @@ mod tests {
         gate: LoadBackGate,
     ) -> (RequestAdmission, RadixRequestLease) {
         let mut lease = RadixRequestLease::default();
-        let admission = mgr.admit_request_lease(tokens, &mut lease, tokens.len() - 1, gate);
+        let admission =
+            mgr.admit_request_lease(tokens, &mut lease, tokens.len() - 1, gate, |_| tokens.len());
         (admission, lease)
     }
 
@@ -2999,7 +3048,7 @@ mod tests {
         let mut lease = RadixRequestLease::default();
         let too_long = seq(1, 20);
         assert!(matches!(
-            mgr.admit_request_lease(&too_long, &mut lease, 19, LoadBackGate::Allow),
+            mgr.admit_request_lease(&too_long, &mut lease, 19, LoadBackGate::Allow, |_| 20),
             RequestAdmission::NoRoom { load: None }
         ));
         assert_eq!(mgr.cache().protected_size(), 0);

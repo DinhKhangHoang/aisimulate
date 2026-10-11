@@ -115,27 +115,14 @@ pub(super) fn get_new_batch_prefill(
             break;
         }
 
-        let chunk_tokens =
-            if ceil_to_block(extend_input, config.block_size) as f64 <= rem_chunk_tokens {
-                extend_input
-            } else {
-                let chunk = (rem_chunk_tokens as usize / config.block_size) * config.block_size;
-                if chunk == 0 {
-                    rejected.push_back(req);
-                    break;
-                }
-                chunk.min(extend_input)
-            };
-
-        // Budgets are charged for computed tokens only (`PrefillAdder._update_prefill_budget`),
-        // not for the cached prefix.
-        let charged_input_tokens = ceil_to_block(chunk_tokens, config.block_size) as f64;
-        let output_reserve = if chunk_tokens < extend_input {
-            0
-        } else {
-            req.remaining_output_tokens()
-                .min(config.clip_max_new_tokens)
+        let Some(chunk_tokens) = chunk_for(extend_input, rem_chunk_tokens, config.block_size)
+        else {
+            rejected.push_back(req);
+            break;
         };
+
+        let (charged_input_tokens, output_reserve) =
+            prefill_charge(&req, chunk_tokens, extend_input, config);
         if charged_input_tokens + output_reserve as f64 >= rem_total_tokens {
             rejected.push_back(req);
             break;
@@ -145,7 +132,7 @@ pub(super) fn get_new_batch_prefill(
             break;
         }
 
-        let chunk_end = start + chunk_tokens;
+        let mut chunk_end = start + chunk_tokens;
         let first_admission = req.materialized_tokens == 0;
         let mut lease = std::mem::take(&mut req.kv_lease);
         let alloc_tokens = req.sequence_prefix(chunk_end);
@@ -177,9 +164,27 @@ pub(super) fn get_new_batch_prefill(
             // (`LayerDoneCounter`) only bounds batches, which prefill already serializes.
             //
             // If the load is refused after all (another in-flight load pins part of the hit, or
-            // no device room), `prefix_len` falls short of `start` and the request computes the
-            // difference too, beyond what the budgets above charged.
-            kv_manager.admit_request_lease(alloc_tokens, &mut lease, start, LoadBackGate::Allow)
+            // no device room), `prefix_len` falls short of `start`. As SGLang 0.5.18
+            // `add_one_req` recomputes `input_tokens` after `init_load_back`, the chunk is sized
+            // again from the admitted prefix: the whole remaining input if it fits the chunk
+            // budget, else truncated to it. SGLang re-checks nothing else here with chunked
+            // prefill on, so the request is never rejected after a load: the earlier chunk check
+            // left at least one page of chunk budget. The budgets below charge this chunk.
+            let sequence_len = req.current_sequence_len();
+            let fit = |prefix_len: usize| {
+                let extend = sequence_len - prefix_len;
+                let chunk = chunk_for(extend, rem_chunk_tokens, config.block_size)
+                    .expect("the chunk check above left a page of chunk budget");
+                chunk_end = prefix_len + chunk;
+                chunk_end
+            };
+            kv_manager.admit_request_lease(
+                alloc_tokens,
+                &mut lease,
+                start,
+                LoadBackGate::Allow,
+                fit,
+            )
         };
 
         let prefix_len = match admitted {
@@ -207,6 +212,17 @@ pub(super) fn get_new_batch_prefill(
             }
         };
         let tokens_computed = chunk_end.saturating_sub(prefix_len);
+        // Charge what admission settled on: a refused load-back computes more than estimated.
+        let (charged_input_tokens, output_reserve) = if first_admission && prefix_len != start {
+            prefill_charge(
+                &req,
+                tokens_computed,
+                req.current_sequence_len() - prefix_len,
+                config,
+            )
+        } else {
+            (charged_input_tokens, output_reserve)
+        };
         // Cache reuse is what the radix tree supplied at admission; a continuation's `prefix_len`
         // is the request's own earlier chunks and must not be reported as a cache hit.
         let admission_reused_tokens = lease.admission_reused_tokens();
@@ -257,4 +273,33 @@ pub(super) fn get_new_batch_prefill(
         prefill_fpm,
         host_loads,
     }
+}
+
+/// SGLang `add_one_req` chunk sizing: the whole `extend_input` if its paged size fits the chunk
+/// budget, else the budget rounded down to whole pages. `None` if not even a page fits.
+fn chunk_for(extend_input: usize, rem_chunk_tokens: f64, block_size: usize) -> Option<usize> {
+    if ceil_to_block(extend_input, block_size) as f64 <= rem_chunk_tokens {
+        return Some(extend_input);
+    }
+    let chunk = (rem_chunk_tokens as usize / block_size) * block_size;
+    (chunk > 0).then(|| chunk.min(extend_input))
+}
+
+/// Budget charge of a chunk of `chunk_tokens` out of `extend_input` tokens left to compute:
+/// the paged input tokens and, for a final chunk, the clipped output reserve. Budgets are charged
+/// for computed tokens only (`PrefillAdder._update_prefill_budget`), not for the cached prefix.
+fn prefill_charge(
+    req: &SglangRequest,
+    chunk_tokens: usize,
+    extend_input: usize,
+    config: &SglangConfig,
+) -> (f64, usize) {
+    let charged_input_tokens = ceil_to_block(chunk_tokens, config.block_size) as f64;
+    let output_reserve = if chunk_tokens < extend_input {
+        0
+    } else {
+        req.remaining_output_tokens()
+            .min(config.clip_max_new_tokens)
+    };
+    (charged_input_tokens, output_reserve)
 }
