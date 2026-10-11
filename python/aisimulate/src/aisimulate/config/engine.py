@@ -976,14 +976,33 @@ def _validate_recommendation_afd(engine: EngineRecommendationConfig) -> None:
             raise ValueError("pure AFD recommendation rejects regular aggregated/prefill/decode workers")
 
 
+def _validate_sglang_host_offload(backend: Any, configured: list[tuple[str, Any]]) -> None:
+    # SGLang HiCache keeps a private host cache per DP rank and models no G3 tier.
+    if backend != "sglang":
+        return
+    for _, worker in configured:
+        if worker.kv_cache.host_offload.scope == "cluster_shared":
+            raise ValueError(
+                "host_offload.scope=cluster_shared is not supported for backend=sglang; "
+                "SGLang HiCache keeps a private host cache per DP rank, use scope=dp_rank_local"
+            )
+        # Recommendation caches have no g3_offload field.
+        if getattr(worker.kv_cache, "g3_offload", None) is not None:
+            raise ValueError(
+                "g3_offload is not supported for backend=sglang with host_offload; "
+                "only the SGLang G2 host cache is modelled"
+            )
+
+
 def _validate_prediction_host_offload(engine: EnginePredictionConfig) -> None:
     configured = _workers_with_host_offload(engine.workers)
     if not configured:
         return
     if engine.mode == "afd":
         raise ValueError("host_offload is supported only for aggregated or disaggregated language workers")
-    if engine.backend != "vllm":
-        raise ValueError("host_offload is supported only for backend=vllm")
+    if engine.backend not in ("vllm", "sglang"):
+        raise ValueError("host_offload is supported only for backend=vllm or backend=sglang")
+    _validate_sglang_host_offload(engine.backend, configured)
     for role, worker in configured:
         if not worker.kv_cache.prefix_caching:
             raise ValueError("host_offload requires prefix_caching=true")
@@ -1014,8 +1033,9 @@ def _validate_recommendation_host_offload(engine: EngineRecommendationConfig) ->
         return
     if engine.mode not in ("aggregated", "disaggregated"):
         raise ValueError("host_offload recommendation requires concrete mode=aggregated or mode=disaggregated")
-    if engine.backend != "vllm":
-        raise ValueError("host_offload recommendation requires concrete backend=vllm")
+    if engine.backend not in ("vllm", "sglang"):
+        raise ValueError("host_offload recommendation requires concrete backend=vllm or backend=sglang")
+    _validate_sglang_host_offload(engine.backend, configured)
     for _, worker in configured:
         if not worker.kv_cache.prefix_caching:
             raise ValueError("host_offload requires prefix_caching=true")

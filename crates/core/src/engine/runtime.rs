@@ -12,7 +12,7 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::generalized::{EngineIdentity, GeneralizedMockerEngine, RankIdentity};
 use crate::engine::host_offload::{G2Binding, SharedG2Pool};
 use crate::engine::scheduler::{SchedulerRank, engine_seed_offset};
-use crate::engine::{EngineConfig, TimingModel};
+use crate::engine::{Backend, EngineConfig, TimingModel};
 
 /// A single-rank or attention-DP engine.
 pub type Engine = GeneralizedMockerEngine<SchedulerRank>;
@@ -89,6 +89,13 @@ impl EngineFactory {
     /// Build one scheduler/KV/timing rank with an explicit identity.
     pub fn build_rank(&self, identity: RankIdentity) -> Result<SchedulerRank> {
         let seed_offset = engine_seed_offset(identity)?;
+        // Belady eviction walks the device tree only and cannot see host-backed nodes.
+        anyhow::ensure!(
+            self.belady_oracle.is_none()
+                || self.config.backend != Backend::Sglang
+                || self.config.native_host_offload.is_none(),
+            "belady eviction is not supported for backend=sglang with native_host_offload; use lru"
+        );
         let mut rank = SchedulerRank::new_with_g2(
             identity,
             &self.config,
@@ -107,5 +114,43 @@ impl EngineFactory {
         GeneralizedMockerEngine::new_with_rank_factory(identity, dp_size, |rank_identity| {
             self.build_rank(rank_identity)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{NativeHostOffloadConfig, TimingModelConfig};
+
+    #[test]
+    fn sglang_host_offload_rejects_a_belady_oracle() {
+        let config = EngineConfig {
+            backend: Backend::Sglang,
+            block_size: 16,
+            kv_cache_bytes_per_token: Some(128 * 1024),
+            native_host_offload: Some(NativeHostOffloadConfig::new(64)),
+            timing_model: TimingModelConfig::Fixed {
+                prefill_ms: 2.0,
+                decode_ms: 1.0,
+            },
+            ..EngineConfig::for_backend(Backend::Sglang)
+        };
+        let factory = EngineFactory::new(config)
+            .unwrap()
+            .with_belady_oracle(BeladyOracle::new(Vec::new()).unwrap());
+        let error = factory
+            .build_rank(RankIdentity {
+                worker_id: 0,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            })
+            .err()
+            .expect("Belady must be rejected for SGLang host offload");
+        assert!(
+            error.to_string().contains(
+                "belady eviction is not supported for backend=sglang with native_host_offload"
+            ),
+            "{error:#}"
+        );
     }
 }

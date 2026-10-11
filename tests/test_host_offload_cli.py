@@ -390,7 +390,7 @@ def test_recommendation_materializes_concrete_host_offload_prediction() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda engine: engine.update(backend="sglang"), "backend=vllm"),
+        (lambda engine: engine.update(backend="trtllm"), "backend=vllm or backend=sglang"),
         (
             lambda engine: engine["workers"]["aggregated"]["kv_cache"].update(prefix_caching=False),
             "prefix_caching=true",
@@ -404,6 +404,67 @@ def test_prediction_host_offload_rejects_unsupported_runtime_scope(mutation, mes
 
     with pytest.raises(ValidationError, match=message):
         CorePredictionConfig.model_validate({"engine": engine})
+
+
+def test_prediction_host_offload_accepts_sglang() -> None:
+    engine = _prediction_engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"]["kv_cache"]["host_offload"] = _host_offload()
+
+    config = CorePredictionConfig.model_validate({"engine": engine})
+
+    assert config.engine.workers.aggregated.kv_cache.host_offload.num_host_blocks == 4096
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda cache: cache["host_offload"].update(scope="cluster_shared"),
+            "scope=cluster_shared is not supported for backend=sglang",
+        ),
+        (
+            lambda cache: cache.update(g3_offload={"scope": "worker_local", "num_g3_blocks": 1}),
+            "g3_offload is not supported for backend=sglang",
+        ),
+    ],
+)
+def test_prediction_sglang_host_offload_rejects_unmodelled_tiers(mutation, message: str) -> None:
+    engine = _prediction_engine()
+    engine["backend"] = "sglang"
+    cache = engine["workers"]["aggregated"]["kv_cache"]
+    cache["host_offload"] = _host_offload()
+    mutation(cache)
+
+    with pytest.raises(ValidationError, match=message):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+def test_recommendation_host_offload_accepts_concrete_sglang() -> None:
+    engine = _recommendation_engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"]["kv_cache"]["host_offload"] = _host_offload()
+
+    CoreRecommendationConfig.model_validate(
+        {
+            "engine": engine,
+            "optimization": {"constraints": {"max_candidate_gpus": 8}},
+        }
+    )
+
+
+def test_recommendation_sglang_host_offload_rejects_cluster_shared() -> None:
+    engine = _recommendation_engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"]["kv_cache"]["host_offload"] = {**_host_offload(), "scope": "cluster_shared"}
+
+    with pytest.raises(ValidationError, match="scope=cluster_shared is not supported for backend=sglang"):
+        CoreRecommendationConfig.model_validate(
+            {
+                "engine": engine,
+                "optimization": {"constraints": {"max_candidate_gpus": 8}},
+            }
+        )
 
 
 def test_recommendation_host_offload_rejects_mixed_backend_domain() -> None:

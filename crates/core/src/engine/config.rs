@@ -957,9 +957,22 @@ impl EngineConfig {
         if let Some(host_offload) = &self.native_host_offload {
             host_offload.validate()?;
             ensure!(
-                self.backend == Backend::Vllm,
-                "native_host_offload is supported only for backend=vllm"
+                matches!(self.backend, Backend::Vllm | Backend::Sglang),
+                "native_host_offload is supported only for backend=vllm or backend=sglang"
             );
+            if self.backend == Backend::Sglang {
+                // SGLang HiCache keeps host residency in its own radix tree, per DP rank.
+                ensure!(
+                    host_offload.scope == G2Scope::DpRankLocal,
+                    "native_host_offload.scope=cluster_shared is not supported for backend=sglang; \
+                     SGLang HiCache keeps a private host cache per DP rank, use scope=dp_rank_local"
+                );
+                ensure!(
+                    self.g3_offload.is_none(),
+                    "g3_offload is not supported for backend=sglang with native_host_offload; \
+                     only the SGLang G2 host cache is modelled"
+                );
+            }
             ensure!(
                 self.enable_prefix_caching,
                 "native_host_offload requires enable_prefix_caching=true"
@@ -1581,7 +1594,10 @@ mod tests {
     #[test]
     fn native_host_offload_rejects_unsupported_scheduler_modes() {
         let cases: &[InvalidHostConfigCase] = &[
-            (|config| config.backend = Backend::Sglang, "backend=vllm"),
+            (
+                |config| config.backend = Backend::Trtllm,
+                "backend=vllm or backend=sglang",
+            ),
             (
                 |config| {
                     config.worker_type = WorkerType::Prefill;
@@ -1614,6 +1630,114 @@ mod tests {
         for &(mutate, expected) in cases {
             assert_invalid_host_config(mutate, expected);
         }
+    }
+
+    fn sglang_native_host_offload_config() -> EngineConfig {
+        EngineConfig {
+            backend: Backend::Sglang,
+            ..native_host_offload_config()
+        }
+    }
+
+    #[test]
+    fn sglang_accepts_dp_rank_local_native_host_offload() {
+        let config = sglang_native_host_offload_config();
+        config.validate().unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EngineConfig>(encoded).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn sglang_native_host_offload_keeps_the_shared_requirements() {
+        let cases: &[InvalidHostConfigCase] = &[
+            (
+                |config| config.enable_prefix_caching = false,
+                "enable_prefix_caching=true",
+            ),
+            (
+                |config| config.aic_nextn = Some(1),
+                "does not support aic_nextn",
+            ),
+            (
+                |config| config.kv_cache_bytes_per_token = None,
+                "requires kv_cache_bytes_per_token",
+            ),
+            (
+                |config| {
+                    config
+                        .native_host_offload
+                        .as_mut()
+                        .unwrap()
+                        .d2h_bandwidth_gbps = f64::NAN;
+                },
+                "d2h_bandwidth_gbps",
+            ),
+        ];
+        for &(mutate, expected) in cases {
+            assert_invalid_host_config(
+                |config| {
+                    config.backend = Backend::Sglang;
+                    mutate(config);
+                },
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn sglang_native_host_offload_rejects_cluster_shared_scope() {
+        let mut config = sglang_native_host_offload_config();
+        let host = config.native_host_offload.take().unwrap();
+        config.native_host_offload = Some(host.cluster_shared("tp1"));
+        let message = config.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("scope=cluster_shared is not supported for backend=sglang"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn sglang_native_host_offload_rejects_g3_offload() {
+        let mut config = sglang_native_host_offload_config();
+        config.g3_offload = serde_json::from_value(serde_json::json!(
+            {"scope": "worker_local", "num_g3_blocks": 1}
+        ))
+        .unwrap();
+        let message = config.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("g3_offload is not supported for backend=sglang"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn sglang_native_host_offload_still_rejects_state_cache_and_kv_cache_groups() {
+        let mut config = sglang_native_host_offload_config();
+        config.state_cache = Some(StateCacheConfig {
+            bytes_per_request: 1500,
+        });
+        let message = config.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("state_cache is supported only for backend=vllm"),
+            "{message}"
+        );
+
+        let mut config: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang",
+            "enable_prefix_caching": false,
+            "kv_cache_capacity_bytes": 1024,
+            "kv_cache_groups": [{
+                "name": "window", "kind": "attention", "num_layers": 4,
+                "block_size_tokens": 4, "page_size_bytes": 64, "sliding_window": 8
+            }]
+        }))
+        .unwrap();
+        config.native_host_offload = Some(NativeHostOffloadConfig::new(4));
+        let message = config.validate().unwrap_err().to_string();
+        assert!(message.contains("kv_cache_groups"), "{message}");
     }
 
     #[test]
