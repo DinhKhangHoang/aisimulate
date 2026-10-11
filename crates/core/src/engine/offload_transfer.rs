@@ -27,6 +27,37 @@ pub(crate) fn bytes_per_ms(gbps: f64) -> f64 {
     }
 }
 
+/// One directional transfer lane that serves transfers in submission order at a
+/// fixed rate. A transfer starts at the later of its ready time and the
+/// previous transfer's completion.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FifoLane {
+    bytes_per_ms: f64,
+    tail_ms: f64,
+}
+
+impl FifoLane {
+    /// A lane at `gbps` decimal GB/s. Zero removes the limit.
+    pub(crate) fn new(gbps: f64) -> Self {
+        Self {
+            bytes_per_ms: bytes_per_ms(gbps),
+            tail_ms: 0.0,
+        }
+    }
+
+    /// Queue `bytes` that become ready at `not_before_ms`; returns the completion time.
+    pub(crate) fn submit(&mut self, not_before_ms: f64, bytes: usize) -> f64 {
+        let starts_at_ms = self.tail_ms.max(not_before_ms);
+        let duration_ms = if self.bytes_per_ms.is_infinite() {
+            0.0
+        } else {
+            bytes as f64 / self.bytes_per_ms
+        };
+        self.tail_ms = starts_at_ms + duration_ms;
+        self.tail_ms
+    }
+}
+
 pub(crate) struct Job {
     pub(crate) id: u64,
     /// Budget group: jobs of one client share `client_rate`.
@@ -190,6 +221,24 @@ mod tests {
             client_rate: bytes_per_ms(rates.0),
             shared_rate: bytes_per_ms(rates.1),
         }
+    }
+
+    #[test]
+    fn fifo_lane_serializes_transfers_after_their_ready_time() {
+        let mut lane = FifoLane::new(1.0);
+        // 1 MB at 1 GB/s takes 1 ms; an idle lane starts at the ready time.
+        assert_eq!(lane.submit(2.0, 1_000_000), 3.0);
+        // A transfer ready before the tail queues behind it.
+        assert_eq!(lane.submit(0.0, 500_000), 3.5);
+        // A transfer ready after the tail leaves the lane idle until then.
+        assert_eq!(lane.submit(10.0, 1_000_000), 11.0);
+    }
+
+    #[test]
+    fn unlimited_fifo_lane_completes_at_the_ready_time() {
+        let mut lane = FifoLane::new(0.0);
+        assert_eq!(lane.submit(4.0, usize::MAX), 4.0);
+        assert_eq!(lane.submit(1.0, 1), 4.0);
     }
 
     fn run(jobs: Vec<Job>) -> Vec<(u64, f64)> {

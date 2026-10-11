@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::{HostOffloadObservation, HostOffloadObservationData, HostOffloadObserver};
 use crate::engine::common::hashing::SequenceHash;
-use crate::engine::offload_transfer::{self, Direction, FairTransfers};
+use crate::engine::offload_transfer::{self, Direction, FairTransfers, FifoLane};
 use crate::engine::{KvBlock, KvEventData, StoredBlocks};
 use anyhow::{Result, bail, ensure};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -229,32 +229,6 @@ impl Lru {
             .filter(|key| is_eligible(*key))
             .take(count)
             .collect()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FifoLane {
-    bytes_per_ms: f64,
-    tail_ms: f64,
-}
-
-impl FifoLane {
-    fn new(gbps: f64) -> Self {
-        Self {
-            bytes_per_ms: offload_transfer::bytes_per_ms(gbps),
-            tail_ms: 0.0,
-        }
-    }
-
-    fn submit(&mut self, not_before_ms: f64, bytes: usize) -> f64 {
-        let starts_at_ms = self.tail_ms.max(not_before_ms);
-        let duration_ms = if self.bytes_per_ms.is_infinite() {
-            0.0
-        } else {
-            bytes as f64 / self.bytes_per_ms
-        };
-        self.tail_ms = starts_at_ms + duration_ms;
-        self.tail_ms
     }
 }
 
