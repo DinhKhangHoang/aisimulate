@@ -372,8 +372,9 @@ impl EngineCore {
     }
 
     pub(crate) fn complete_engine_boundary(&mut self, now_ms: f64) {
-        if let Self::Vllm(core) = self {
-            core.complete_engine_boundary(now_ms);
+        match self {
+            Self::Vllm(core) => core.complete_engine_boundary(now_ms),
+            Self::Sglang(core) => core.complete_engine_boundary(now_ms),
         }
     }
 

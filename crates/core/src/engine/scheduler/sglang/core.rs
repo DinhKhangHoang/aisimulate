@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::engine::belady::BeladyOracle;
 #[cfg(test)]
 use crate::engine::cache::radix_cache::KvPageId;
+use crate::engine::cache::radix_cache::LoadBackHandle;
 use crate::engine::common::protocols::{
     DirectRequest, KvEventPublishers, MockEngineArgs, OutputSignal, WorkerType,
 };
@@ -37,6 +38,7 @@ use super::decode::{
     cache_materialized_prefix, cleanup_completed_request, simulate_decode_step_with_sampler,
     simulate_prefill_first_tokens,
 };
+use super::host_transfer::HostTransferClock;
 use super::policy::apply_schedule_policy;
 use super::prefill::get_new_batch_prefill;
 use super::request::{SglangRequest, WaitingQueue};
@@ -57,6 +59,16 @@ pub(crate) struct SglangCore {
     pub(super) running: Vec<SglangRequest>,
     pub(super) new_token_ratio: f64,
     pub(super) kv_manager: SglangKvManager,
+    /// D2H/H2D timing under SGLang HiCache write_back (`native_host_offload`).
+    host_clock: Option<HostTransferClock>,
+    /// Load-backs of the last prefill batch. The pass already waited for their
+    /// H2D copy; they are finished at its engine boundary, or at the start of
+    /// the next pass when the caller has no boundary. Until then the cache
+    /// keeps the loaded nodes pinned.
+    in_flight_loads: Vec<LoadBackHandle>,
+    /// Set when a prefill pass fails under write_back. There is no admission
+    /// checkpoint to roll back to, so the core refuses every later pass.
+    poisoned: bool,
     belady: Option<BeladyOracle>,
     speculative_sampler: Option<SpeculativeDecodeSampler>,
     kv_event_buffer: Option<CapturedKvEventBuffer>,
@@ -222,6 +234,16 @@ impl SglangCore {
                     args.emit_kv_token_ids,
                 ),
             },
+            host_clock: args.native_host_offload.as_ref().map(|host_offload| {
+                HostTransferClock::new(
+                    host_offload,
+                    args.block_size,
+                    args.kv_cache_bytes_per_token
+                        .expect("validated native host offload requires KV byte geometry"),
+                )
+            }),
+            in_flight_loads: Vec::new(),
+            poisoned: false,
             belady: None,
             speculative_sampler,
             kv_event_buffer,
@@ -768,6 +790,31 @@ impl SglangCore {
             .expect("destination capacity generation overflow");
     }
 
+    /// The engine boundary after a pass: its load-backs' H2D copies are done.
+    pub(crate) fn complete_engine_boundary(&mut self, _now_ms: f64) {
+        self.finish_load_backs();
+    }
+
+    /// Finish every in-flight load-back exactly once (SGLang `loading_check`).
+    fn finish_load_backs(&mut self) {
+        for handle in self.in_flight_loads.drain(..) {
+            self.kv_manager.finish_load_back(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn in_flight_load_backs(&self) -> usize {
+        self.in_flight_loads.len()
+    }
+
+    /// (D2H, H2D) pages copied by HiCache write_back so far.
+    #[cfg(test)]
+    pub(super) fn host_transfer_pages(&self) -> (usize, usize) {
+        self.host_clock
+            .as_ref()
+            .map_or((0, 0), HostTransferClock::pages)
+    }
+
     pub(crate) fn drain_kv_events(&self) -> Vec<crate::engine::KvEvent> {
         self.kv_event_buffer
             .as_ref()
@@ -822,6 +869,14 @@ impl SglangCore {
         mut collector: Option<&mut TraceCollector>,
         now_ms: f64,
     ) -> anyhow::Result<EnginePassResult> {
+        anyhow::ensure!(
+            !self.poisoned,
+            "SGLang core state is undefined after a failed prefill under HiCache write_back \
+             (native_host_offload); the pass cannot be retried"
+        );
+        // A caller without engine boundaries still serializes passes: the
+        // previous pass, and so its H2D copies, ended before this one starts.
+        self.finish_load_backs();
         let grouped = std::mem::take(&mut self.group_pass_prepared);
         let defer_prefill = self.prefill_rounds_remaining > 0;
         let remaining_after_round = self.prefill_rounds_remaining.saturating_sub(1);
@@ -848,8 +903,11 @@ impl SglangCore {
         // Preserve admission around validation, prediction and duration conversion.
         // The built-in polynomial remains infallible; external providers may fail
         // after accepting geometry. Lease checkpoints are not independent owners.
+        // Under HiCache write_back the cache cannot be snapshotted; a failure
+        // poisons the core instead (see the error path below).
         let admission_checkpoint = (!self.waiting.is_empty()
-            && self.config.perf_model.prefill_pass_can_fail())
+            && self.config.perf_model.prefill_pass_can_fail()
+            && !self.kv_manager.is_write_back())
         .then(|| {
             // FIFO admission only touches an admitted prefix and possibly its
             // first blocked request. LPM may reorder the small queue it scores;
@@ -901,6 +959,20 @@ impl SglangCore {
             AdmissionStage::FreshKv => Default::default(),
         };
 
+        // Load-backs started by this batch, and the D2H copies of everything
+        // demoted since the last pass (commands and this admission).
+        let load_pages: usize = admit.host_loads.iter().map(|load| load.pages).sum();
+        self.in_flight_loads
+            .extend(admit.host_loads.drain(..).map(|load| load.handle));
+        if let Some(clock) = self.host_clock.as_mut() {
+            let h2d_pages = self.kv_manager.take_h2d_pages();
+            debug_assert_eq!(
+                h2d_pages, load_pages,
+                "every load-back belongs to the batch"
+            );
+            clock.write_back(now_ms, self.kv_manager.take_d2h_pages());
+        }
+
         let batch_size = admit.can_run.len();
         let mean_isl = admit.total_isl.checked_div(batch_size).unwrap_or(0);
         let mean_prefix = admit.total_prefix.checked_div(batch_size).unwrap_or(0);
@@ -920,6 +992,16 @@ impl SglangCore {
                     self.kv_manager.commit_admission(checkpoint);
                 }
                 duration
+            }
+            Err(error) if self.kv_manager.is_write_back() => {
+                // Admission may have evicted, demoted, loaded back and
+                // published events, none of which can be undone.
+                self.poisoned = true;
+                self.finish_load_backs();
+                return Err(error.context(
+                    "SGLang prefill failed under HiCache write_back (native_host_offload); \
+                     the core is poisoned because its admission cannot be rolled back",
+                ));
             }
             Err(error) => {
                 // A retry is still part of the caller's prepared group round;
@@ -1033,7 +1115,28 @@ impl SglangCore {
         };
         self.interval_idle_in_pass = defer_prefill && scheduled_decode_lens.is_empty();
 
-        let decode_start_ms = now_ms + prefill_time.as_secs_f64() * 1000.0;
+        let prefill_ms = prefill_time.as_secs_f64() * 1000.0;
+        let decode_work = !prefill_pass && !scheduled_decode_lens.is_empty();
+        // HiCache write_back timing (one D2H and one H2D lane per DP rank):
+        // - a forward pass starts after the synchronous D2H copies charged so
+        //   far (`compute_start`), so an eviction stalls the step it triggered;
+        // - the batch's loads start then, and the prefill ends no earlier than
+        //   `max(start, h2d_done) + prefill_ms`. SGLang overlaps the copy layer
+        //   by layer (`h2d_done + prefill_ms / num_layers` would be the tight
+        //   bound), but the scheduler does not know `num_layers`, so this
+        //   overestimates by up to the overlap.
+        // Idle passes are not delayed: nothing waits on a copy without work.
+        let decode_start_ms = match self.host_clock.as_mut() {
+            Some(clock) if prefill_pass || decode_work => {
+                let start_ms = clock.compute_start(now_ms);
+                if load_pages > 0 {
+                    start_ms.max(clock.load(start_ms, load_pages)) + prefill_ms
+                } else {
+                    start_ms + prefill_ms
+                }
+            }
+            _ => now_ms + prefill_ms,
+        };
         let decode = if prefill_pass {
             simulate_prefill_first_tokens(
                 &mut self.running,
@@ -1067,6 +1170,15 @@ impl SglangCore {
                 return Err(error);
             }
         };
+        if let Some(clock) = self.host_clock.as_mut() {
+            // Demotions for decode growth happen before the decode forward and
+            // stall it. After a prefill forward (first-token slots) they stall
+            // the next pass through `compute_start`.
+            clock.write_back(decode_start_ms, self.kv_manager.take_d2h_pages());
+            if decode_work {
+                decode.end_ms += clock.compute_start(decode_start_ms) - decode_start_ms;
+            }
+        }
         if !prefill_pass {
             // The decode step can retract requests before executing the batch.
             committed_requests.extend(

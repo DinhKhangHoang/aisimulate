@@ -3388,6 +3388,7 @@ fn native_host_offload_builds_a_write_back_kv_manager() {
 
     let mut args = test_args(32, 4, 4);
     args.enable_prefix_caching = true;
+    args.kv_cache_bytes_per_token = Some(16);
     args.native_host_offload = Some(crate::engine::NativeHostOffloadConfig::new(24));
     let core = SglangCore::new(args);
     assert!(core.kv_manager.is_write_back());
@@ -3395,4 +3396,300 @@ fn native_host_offload_builds_a_write_back_kv_manager() {
     let host_pool = core.kv_manager.cache().host_pool().expect("host pool");
     assert_eq!(host_pool.total_pages(), 24);
     assert_eq!(core.kv_manager.cache().available_tokens(), 32 * 4);
+}
+
+/// SGLang HiCache write_back (G2) in the scheduler: load-back admission, the
+/// D2H/H2D timing model and load-back completion.
+mod hicache_write_back {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const BYTES_PER_TOKEN: usize = 1_000_000;
+    const PAGE: usize = 4;
+
+    /// Linear, infallible timing: 1 ms per computed prefill token, 1 ms per decode step.
+    struct LinearTiming {
+        fail_prefill: Option<Arc<AtomicBool>>,
+    }
+
+    impl crate::engine::TimingModel for LinearTiming {
+        fn prefill_batch_validation_can_fail(&self) -> bool {
+            false
+        }
+
+        fn prefill_prediction_can_fail(&self) -> bool {
+            self.fail_prefill.is_some()
+        }
+
+        fn predict_prefill_ms(
+            &self,
+            batch_size: usize,
+            mean_isl: usize,
+            mean_prefix: usize,
+        ) -> anyhow::Result<f64> {
+            anyhow::ensure!(
+                !self
+                    .fail_prefill
+                    .as_ref()
+                    .is_some_and(|fail| fail.load(Ordering::Relaxed)),
+                "prefill timing unavailable"
+            );
+            Ok((batch_size * (mean_isl - mean_prefix)) as f64)
+        }
+
+        fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+    }
+
+    fn install_timing(core: &mut SglangCore, fail_prefill: Option<Arc<AtomicBool>>) {
+        core.config.perf_model = crate::engine::common::perf_model::PerfModel::External {
+            timing: Arc::new(LinearTiming { fail_prefill }),
+        }
+        .into();
+    }
+
+    /// 16 device pages of 4 tokens; `host` gives 64 host pages with the
+    /// given (D2H, H2D) bandwidths in GB/s, where zero is unlimited.
+    fn core(host: Option<(f64, f64)>) -> SglangCore {
+        let mut args = test_args(16, PAGE, 256);
+        args.enable_prefix_caching = true;
+        args.kv_cache_bytes_per_token = Some(BYTES_PER_TOKEN);
+        args.native_host_offload = host.map(|(d2h, h2d)| {
+            let mut config = crate::engine::NativeHostOffloadConfig::new(64);
+            config.d2h_bandwidth_gbps = d2h;
+            config.h2d_bandwidth_gbps = h2d;
+            config
+        });
+        let mut core = SglangCore::new(args);
+        install_timing(&mut core, None);
+        core
+    }
+
+    struct Run {
+        reused_input_tokens: usize,
+        started_ms: f64,
+        first_token_ms: f64,
+        end_ms: f64,
+    }
+
+    /// Submit one single-output request at `now` and run passes until it
+    /// completes, completing each pass at its engine boundary.
+    fn run(core: &mut SglangCore, tokens: Vec<u32>, now: f64) -> Run {
+        let uuid = core.receive(direct_request(tokens, 1));
+        let mut now_ms = now;
+        let mut reused_input_tokens = None;
+        let mut first_token_ms = None;
+        for _ in 0..20 {
+            let pass = core.execute_hidden_pass(now_ms);
+            core.complete_engine_boundary(pass.end_ms);
+            if let Some(admission) = pass.admissions.iter().find(|a| a.uuid == uuid) {
+                reused_input_tokens = Some(admission.reused_input_tokens);
+            }
+            let signal = pass.output_signals.iter().find(|s| s.uuid == uuid);
+            if signal.is_some_and(|s| s.token_id.is_some()) && first_token_ms.is_none() {
+                first_token_ms = Some(pass.end_ms);
+            }
+            now_ms = pass.end_ms;
+            if signal.is_some_and(|s| s.completed) {
+                return Run {
+                    reused_input_tokens: reused_input_tokens.expect("admitted"),
+                    started_ms: now,
+                    first_token_ms: first_token_ms.expect("first token"),
+                    end_ms: now_ms,
+                };
+            }
+        }
+        panic!("request did not complete");
+    }
+
+    fn prompt_a() -> Vec<u32> {
+        (0..32).collect()
+    }
+
+    fn prompt_b() -> Vec<u32> {
+        (1000..1056).collect()
+    }
+
+    /// A, then B (which pushes A off the device), then A again.
+    fn repeat_after_pressure(core: &mut SglangCore) -> (Run, Run, Run) {
+        let a = run(core, prompt_a(), 0.0);
+        let b = run(core, prompt_b(), a.end_ms);
+        let again = run(core, prompt_a(), b.end_ms);
+        (a, b, again)
+    }
+
+    fn assert_no_pinned_load_backs(core: &mut SglangCore) {
+        assert_eq!(core.in_flight_load_backs(), 0);
+        let cache = core.kv_manager.cache();
+        assert_eq!(cache.protected_size(), 0);
+        // Nothing stays pinned: every cached device page can be evicted.
+        let total = cache.total_tokens();
+        core.kv_manager.evict(total);
+        assert_eq!(core.kv_manager.cache().available_tokens(), total);
+    }
+
+    #[test]
+    fn repeated_prompt_after_device_pressure_loads_the_host_hit_back() {
+        let mut instant = core(Some((0.0, 0.0)));
+        let mut limited = core(Some((0.0, 10.0)));
+        let mut recompute = core(None);
+        let (_, b_instant, instant_again) = repeat_after_pressure(&mut instant);
+        let (_, b_limited, limited_again) = repeat_after_pressure(&mut limited);
+        let (_, b_recompute, recompute_again) = repeat_after_pressure(&mut recompute);
+        // Unlimited D2H: the runs agree until the repeated prompt.
+        assert_eq!(b_instant.end_ms, b_recompute.end_ms);
+        assert_eq!(b_limited.end_ms, b_recompute.end_ms);
+
+        // The host hit counts as reuse: 7 of 8 pages, capped at input_len - 1.
+        assert_eq!(instant_again.reused_input_tokens, 28);
+        assert_eq!(limited_again.reused_input_tokens, 28);
+        assert_eq!(recompute_again.reused_input_tokens, 0);
+
+        // Prefill computes 4 tokens after the load (4 ms) instead of 32.
+        let ttft = |run: &Run| run.first_token_ms - run.started_ms;
+        assert_eq!(ttft(&instant_again), 4.0);
+        assert_eq!(ttft(&recompute_again), 32.0);
+        // 28 tokens x 1 MB at 10 GB/s = 2.8 ms of H2D before the prefill
+        // (the conservative bound: num_layers is not known to the scheduler).
+        assert!(
+            (ttft(&limited_again) - 6.8).abs() < 1e-9,
+            "{}",
+            ttft(&limited_again)
+        );
+        assert!(ttft(&instant_again) < ttft(&limited_again));
+        assert!(ttft(&limited_again) < ttft(&recompute_again));
+
+        assert_no_pinned_load_backs(&mut instant);
+        assert_no_pinned_load_backs(&mut limited);
+    }
+
+    #[test]
+    fn write_back_eviction_stalls_the_pass_that_triggered_it() {
+        let mut unlimited = core(Some((0.0, 0.0)));
+        let mut limited = core(Some((10.0, 0.0)));
+        let a_unlimited = run(&mut unlimited, prompt_a(), 0.0);
+        let a_limited = run(&mut limited, prompt_a(), 0.0);
+        assert_eq!(a_unlimited.end_ms, a_limited.end_ms);
+
+        // B's admission demotes A's 8 pages: 32 MB at 10 GB/s = 3.2 ms.
+        let b_unlimited = run(&mut unlimited, prompt_b(), a_unlimited.end_ms);
+        let b_limited = run(&mut limited, prompt_b(), a_limited.end_ms);
+        let ttft = |run: &Run| run.first_token_ms - run.started_ms;
+        assert_eq!(ttft(&b_unlimited), 56.0);
+        assert!(
+            (ttft(&b_limited) - 59.2).abs() < 1e-9,
+            "{}",
+            ttft(&b_limited)
+        );
+        assert_eq!(limited.host_transfer_pages(), (8, 0));
+    }
+
+    #[test]
+    fn write_back_eviction_in_a_decode_step_stalls_that_step() {
+        let mut durations = Vec::new();
+        for d2h in [0.0, 10.0] {
+            let mut core = core(Some((d2h, 0.0)));
+            // Cache 12 pages and leave 4 free for a 15-token request, whose
+            // decode growth past 16 tokens must demote the cached node.
+            let warm = run(&mut core, (500..548).collect(), 0.0);
+            core.receive(direct_request((0..15).collect(), 4));
+            let mut now = warm.end_ms;
+            let mut passes = Vec::new();
+            while !core.is_empty() {
+                let pass = core.execute_hidden_pass(now);
+                core.complete_engine_boundary(pass.end_ms);
+                passes.push((pass.admissions.is_empty(), pass.end_ms - now));
+                now = pass.end_ms;
+            }
+            durations.push((passes, core.host_transfer_pages()));
+        }
+        let (unlimited, (unlimited_d2h, _)) = &durations[0];
+        let (limited, (limited_d2h, _)) = &durations[1];
+        assert_eq!(unlimited_d2h, limited_d2h);
+        // The warm prompt's 12 pages: 48 MB at 10 GB/s = 4.8 ms.
+        assert_eq!(*limited_d2h, 12);
+        assert_eq!(unlimited.len(), limited.len());
+        let stalled: Vec<_> = unlimited
+            .iter()
+            .zip(limited)
+            .filter(|(fast, slow)| fast.1 != slow.1)
+            .map(|(fast, slow)| (slow.0, slow.1 - fast.1))
+            .collect();
+        assert_eq!(stalled.len(), 1, "{unlimited:?} vs {limited:?}");
+        let (decode_pass, stall_ms) = stalled[0];
+        assert!(decode_pass, "the eviction happens in a decode step");
+        assert!((stall_ms - 4.8).abs() < 1e-9, "{stall_ms}");
+    }
+
+    #[test]
+    fn cancel_during_a_load_back_pass_still_finishes_the_load() {
+        let mut core = core(Some((0.0, 10.0)));
+        let a = run(&mut core, prompt_a(), 0.0);
+        let b = run(&mut core, prompt_b(), a.end_ms);
+        let uuid = core.receive(direct_request(prompt_a(), 4));
+        let pass = core.execute_hidden_pass(b.end_ms);
+        assert_eq!(pass.admissions[0].reused_input_tokens, 28);
+        assert_eq!(core.in_flight_load_backs(), 1);
+        // The request is cancelled while its load-back is still in flight.
+        core.apply_command(SchedulerCommand::CancelRequest { request_id: uuid })
+            .unwrap();
+        assert_eq!(core.in_flight_load_backs(), 1);
+        core.complete_engine_boundary(pass.end_ms);
+        assert!(core.is_empty());
+        assert_no_pinned_load_backs(&mut core);
+    }
+
+    #[test]
+    fn next_pass_finishes_loads_left_by_a_pass_without_a_boundary() {
+        let mut core = core(Some((0.0, 10.0)));
+        let a = run(&mut core, prompt_a(), 0.0);
+        let b = run(&mut core, prompt_b(), a.end_ms);
+        core.receive(direct_request(prompt_a(), 1));
+        let pass = core.execute_hidden_pass(b.end_ms);
+        assert_eq!(core.in_flight_load_backs(), 1);
+        let next = core.execute_hidden_pass(pass.end_ms);
+        assert_eq!(core.in_flight_load_backs(), 0);
+        assert!(next.output_signals.iter().all(|signal| signal.completed));
+        assert!(core.is_empty());
+        assert_no_pinned_load_backs(&mut core);
+    }
+
+    #[test]
+    fn failed_prefill_poisons_the_write_back_core() {
+        let mut core = core(Some((0.0, 0.0)));
+        let fail = Arc::new(AtomicBool::new(true));
+        install_timing(&mut core, Some(Arc::clone(&fail)));
+        assert!(core.config.perf_model.prefill_pass_can_fail());
+        core.receive(direct_request(prompt_a(), 1));
+        // No admission checkpoint is opened under write_back (it would panic).
+        let error = core.try_execute_hidden_pass(0.0).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("prefill timing unavailable"),
+            "{error:#}"
+        );
+        fail.store(false, Ordering::Relaxed);
+        for now in [0.0, 10.0] {
+            let error = core.try_execute_hidden_pass(now).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("undefined after a failed prefill"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_write_back_failed_prefill_still_rolls_back() {
+        let mut core = core(None);
+        let fail = Arc::new(AtomicBool::new(true));
+        install_timing(&mut core, Some(Arc::clone(&fail)));
+        core.receive(direct_request(prompt_a(), 1));
+        assert!(core.try_execute_hidden_pass(0.0).is_err());
+        fail.store(false, Ordering::Relaxed);
+        let pass = core.try_execute_hidden_pass(0.0).unwrap();
+        assert_eq!(pass.admissions.len(), 1);
+    }
 }

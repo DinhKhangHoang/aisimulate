@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use uuid::Uuid;
 
 use crate::engine::common::perf_model::PerfModel;
@@ -88,19 +88,9 @@ impl SchedulerRank {
         );
         let mut args = core_args(config, timing);
         if config.backend == Backend::Sglang {
-            if config.native_host_offload.is_some() {
-                // The SGLang admission checkpoint is built only for fallible
-                // providers, and its snapshot cannot hold host-backed tree state.
-                ensure!(
-                    !args.perf_model.prefill_pass_can_fail(),
-                    "native_host_offload for backend=sglang requires a timing provider whose prefill pass cannot fail \
-                     (built-in polynomial or fixed timing); the admission rollback checkpoint cannot snapshot host cache state"
-                );
-                bail!(
-                    "native_host_offload is not yet modelled by the SGLang scheduler; \
-                     remove native_host_offload or use backend=vllm"
-                );
-            }
+            // native_host_offload selects HiCache write_back. A fallible
+            // prefill provider is accepted: the core has no admission
+            // checkpoint under write_back and poisons itself on a failure.
             normalize_sglang_attention_dp(&mut args, identity.dp_size.get())?;
         }
         let capture_kv_events = config.emit_kv_events;
@@ -719,45 +709,76 @@ mod tests {
         )
     }
 
+    fn submit(rank: &mut SchedulerRank, request: u128, tokens: Vec<u32>, now_ms: f64) {
+        rank.apply_command_effects(
+            Command::Submit(Request {
+                request_id: Uuid::from_u128(request),
+                tokens,
+                max_output_tokens: 2,
+                output_token_ids: None,
+            }),
+            CommandContext {
+                now_ms,
+                pass_in_flight: false,
+            },
+            None,
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn sglang_host_offload_rejects_a_fallible_prefill_timing_provider() {
+    fn sglang_host_offload_failed_prefill_poisons_the_rank() {
         struct FallibleTiming;
         impl TimingModel for FallibleTiming {
             fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> Result<f64> {
-                Ok(1.0)
+                Err(anyhow!("prefill prediction unavailable"))
             }
             fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> Result<f64> {
                 Ok(1.0)
             }
         }
-        let error = sglang_host_offload_rank(Arc::new(FallibleTiming))
-            .err()
-            .expect("a fallible prefill provider must be rejected");
+        let mut rank = sglang_host_offload_rank(Arc::new(FallibleTiming))
+            .expect("a fallible prefill provider is accepted under write_back");
+        submit(&mut rank, 95_001, (0..40).collect(), 0.0);
+        let first = rank.execute_pass(0.0).err().expect("prefill fails");
         assert!(
-            error
-                .to_string()
-                .contains("requires a timing provider whose prefill pass cannot fail"),
-            "{error:#}"
+            format!("{first:#}").contains("prefill prediction unavailable"),
+            "{first:#}"
+        );
+        let later = rank
+            .execute_pass(1.0)
+            .err()
+            .expect("the rank stays poisoned");
+        assert!(
+            format!("{later:#}").contains("undefined after a failed prefill"),
+            "{later:#}"
         );
     }
 
     #[test]
-    fn sglang_host_offload_is_rejected_until_the_scheduler_models_it() {
+    fn sglang_host_offload_rank_builds_and_runs() {
         let timing = TimingModelConfig::Fixed {
             prefill_ms: 2.0,
             decode_ms: 1.0,
         };
-        let error = sglang_host_offload_rank(
+        let mut rank = sglang_host_offload_rank(
             crate::engine::timing::built_in_timing_model(&timing).unwrap(),
         )
-        .err()
-        .expect("an unmodelled host cache must not be ignored silently");
-        assert!(
-            error
-                .to_string()
-                .contains("native_host_offload is not yet modelled by the SGLang scheduler"),
-            "{error:#}"
-        );
+        .expect("backend=sglang models native_host_offload");
+        submit(&mut rank, 95_101, (0..40).collect(), 0.0);
+        let mut now_ms = 0.0;
+        let mut completed = false;
+        for _ in 0..16 {
+            let pass = rank.execute_pass(now_ms).unwrap();
+            now_ms = pass.end_ms.max(now_ms);
+            let effects = rank.complete_pass(pass.pending, now_ms).unwrap();
+            if effects.outputs.iter().any(|output| output.completed) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "the request finishes on a host-offload rank");
+        assert!(now_ms > 0.0);
     }
 
     #[test]

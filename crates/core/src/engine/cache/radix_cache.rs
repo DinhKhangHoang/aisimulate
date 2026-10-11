@@ -286,7 +286,6 @@ impl EvictionOutcome {
 /// Smallest Full-KV load-back SGLang performs, in tokens: shorter host hits
 /// are recomputed instead (`UnifiedRadixCache.load_back_threshold`, URC:515,
 /// applied as `max(1, threshold)` in `_load_back_transfers`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LOAD_BACK_THRESHOLD_TOKENS: usize = 10;
 
 /// Load-backs SGLang keeps in flight at once. `has_free_load_back_slot`
@@ -312,7 +311,6 @@ pub(crate) struct PrefixMatch {
 
 impl PrefixMatch {
     /// Host-only prefix after the device prefix, in tokens.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn host_tokens(&self) -> usize {
         self.host_hit.map_or(0, |hit| hit.tokens)
     }
@@ -329,7 +327,6 @@ pub(crate) struct HostHit {
 
 impl HostHit {
     /// Host-only prefix tokens (SGLang `host_hit_length` times page size).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn tokens(&self) -> usize {
         self.tokens
     }
@@ -337,7 +334,6 @@ impl HostHit {
 
 /// Why [`RadixCache::load_back`] declined; the request recomputes the host hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LoadBackRefusal {
     /// The anchor is gone or already back on device; match again.
     Stale,
@@ -365,7 +361,6 @@ pub(crate) enum LoadBackResult {
 
 /// A committed H->D load-back.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LoadedBack {
     /// Each loaded device page with the host page it is copied from, in
     /// prefix order (ancestors first).
@@ -385,7 +380,6 @@ pub(crate) struct LoadedBack {
 /// device and host lock receipts on the anchor, released by
 /// [`RadixCache::finish_load_back`].
 #[must_use = "an unfinished load-back keeps its node locked and pinned"]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LoadBackHandle {
     anchor: NodeId,
     lock: DecLockRefParams,
@@ -414,7 +408,6 @@ pub(crate) struct InsertPageResult {
     pub(crate) unretained_pages: Vec<KvPageId>,
     /// Host pages the insert released, already returned to the host pool. A
     /// Full-only tree never produces them; see `collect_unretained_pages`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unretained_host_pages: Vec<HostPageId>,
 }
 
@@ -590,7 +583,6 @@ impl RadixCache {
     /// Build a cache that offloads evicted device KV to a host pool of
     /// `host_pages` pages, following SGLang HiCache's write_back policy:
     /// a device leaf is copied to host when it is evicted, then demoted.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_write_back(total_tokens: usize, page_size: usize, host_pages: usize) -> Self {
         Self::build(total_tokens, page_size, Some(HostPagePool::new(host_pages)))
     }
@@ -622,7 +614,6 @@ impl RadixCache {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn host_pool(&self) -> Option<&HostPagePool> {
         self.host_pool.as_ref()
     }
@@ -781,7 +772,6 @@ impl RadixCache {
     ///    temporary `_lock_node` on the old `last_node` is released. The
     ///    request's prefix pages are then `collect_path_pages_through(
     ///    last_node, device_tokens + tokens)`, exactly as for a device hit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn load_back(&mut self, hit: HostHit, mem_quota: Option<usize>) -> LoadBackResult {
         assert!(
             self.host_pool.is_some(),
@@ -896,7 +886,6 @@ impl RadixCache {
     /// lock and the host lock, then unpin the loaded nodes. The host copy
     /// stays as a coexisting duplicate that host eviction reclaims first.
     /// The request lock taken by [`Self::load_back`] is not touched.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish_load_back(&mut self, handle: LoadBackHandle) {
         let LoadBackHandle {
             anchor,
@@ -909,7 +898,6 @@ impl RadixCache {
             .expect("live load-back anchor");
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn release_load_back_locks(
         &mut self,
         anchor: NodeId,

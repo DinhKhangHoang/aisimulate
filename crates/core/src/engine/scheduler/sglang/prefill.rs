@@ -7,6 +7,9 @@ use super::super::AdmissionEvent;
 use super::config::{SglangConfig, ceil_to_block};
 use super::request::{SglangRequest, WaitingQueue};
 use crate::engine::kv_manager::SglangKvManager;
+use crate::engine::kv_manager::sglang_backend::{
+    AdmittedPrefix, HostLoad, LoadBackGate, RequestAdmission,
+};
 
 /// Per-request prefill data needed for FPM snapshot construction.
 pub(super) struct PrefillFpmItem {
@@ -28,6 +31,9 @@ pub(super) struct AdmitResult {
     pub(super) total_prefix: usize,
     /// Per-request prefill info for building FPM snapshots.
     pub(super) prefill_fpm: Vec<PrefillFpmItem>,
+    /// SGLang HiCache load-backs started for this batch. The scheduler times
+    /// their H2D copy and finishes them once the batch's pass completes.
+    pub(super) host_loads: Vec<HostLoad>,
 }
 
 /// Behavioral model of SGLang's prefill admission (`Scheduler.get_new_batch_prefill`,
@@ -65,6 +71,7 @@ pub(super) fn get_new_batch_prefill(
     let mut rejected = VecDeque::new();
     let mut total_isl = 0usize;
     let mut total_prefix = 0usize;
+    let mut host_loads = Vec::new();
 
     let available_running_slots = config.max_running_requests.saturating_sub(running.len());
     while can_run.len() < available_running_slots
@@ -86,9 +93,17 @@ pub(super) fn get_new_batch_prefill(
             };
             let page_hashes = req.kv_lease.page_hashes();
             let pages = (match_len / config.block_size).min(page_hashes.len());
-            kv_manager
-                .cache()
-                .prefix_match_hashes_len(&page_hashes[..pages])
+            if kv_manager.is_write_back() {
+                // HiCache: the host hit that admission loads back is prefix
+                // too, so the chunk and budgets below cover only the tokens
+                // computed after it (`PrefillAdder.add_one_req` recomputes
+                // `extend_input_len` after `init_load_back`).
+                kv_manager.reusable_prefix_with_host(&page_hashes[..pages])
+            } else {
+                kv_manager
+                    .cache()
+                    .prefix_match_hashes_len(&page_hashes[..pages])
+            }
         } else {
             0
         };
@@ -135,7 +150,7 @@ pub(super) fn get_new_batch_prefill(
         let mut lease = std::mem::take(&mut req.kv_lease);
         let alloc_tokens = req.sequence_prefix(chunk_end);
 
-        let prefix_len = if req.materialized_tokens > 0 {
+        let admitted = if req.materialized_tokens > 0 {
             if !lease.is_active() {
                 panic!(
                     "prefill: request {} has materialized_tokens={} but no active KV lease",
@@ -143,18 +158,44 @@ pub(super) fn get_new_batch_prefill(
                 );
             }
             // Continuation: extend the request's own pages; no re-match.
-            kv_manager.extend_allocation(alloc_tokens, &mut lease)
+            kv_manager
+                .extend_allocation(alloc_tokens, &mut lease)
+                .map_or(RequestAdmission::NoRoom, |prefix_len| {
+                    RequestAdmission::Admitted(AdmittedPrefix {
+                        prefix_len,
+                        load: None,
+                    })
+                })
         } else {
-            // Locks the path the read-only match above saw, matching no further than that cap so
+            // Locks the path the match above saw, matching no further than that cap so
             // physical ownership and `cached_tokens` also stop at `input_len - 1`: the last token
             // of a fully cached prompt is computed and gets its own KV slot.
-            kv_manager.allocate_for_request_lease_capped(alloc_tokens, &mut lease, start)
+            //
+            // Under HiCache write_back a host hit is loaded back here. Aggregated prefill never
+            // gates on a free load slot: SGLang starts the loads of one prefill batch together
+            // and the forward pass waits for them layer by layer, so the in-flight cap
+            // (`LayerDoneCounter`) only bounds batches, which prefill already serializes.
+            //
+            // If the load is refused after all (another in-flight load pins part of the hit, or
+            // no device room), `prefix_len` falls short of `start` and the request computes the
+            // difference too, beyond what the budgets above charged.
+            kv_manager.admit_request_lease(alloc_tokens, &mut lease, start, LoadBackGate::Allow)
         };
 
-        let Some(prefix_len) = prefix_len else {
-            req.kv_lease = lease;
-            rejected.push_back(req);
-            break;
+        let prefix_len = match admitted {
+            RequestAdmission::Admitted(AdmittedPrefix { prefix_len, load }) => {
+                if let Some(load) = load {
+                    host_loads.push(*load);
+                }
+                prefix_len
+            }
+            // `NoRoom` is the old allocation failure. `WaitForLoadSlot` keeps the request
+            // waiting the same way; it cannot occur under `LoadBackGate::Allow`.
+            RequestAdmission::NoRoom | RequestAdmission::WaitForLoadSlot => {
+                req.kv_lease = lease;
+                rejected.push_back(req);
+                break;
+            }
         };
         let tokens_computed = chunk_end.saturating_sub(prefix_len);
         // Cache reuse is what the radix tree supplied at admission; a continuation's `prefix_len`
@@ -205,5 +246,6 @@ pub(super) fn get_new_batch_prefill(
         total_isl,
         total_prefix,
         prefill_fpm,
+        host_loads,
     }
 }

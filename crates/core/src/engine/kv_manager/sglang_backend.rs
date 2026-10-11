@@ -161,7 +161,7 @@ pub(crate) struct AllocResult {
 
 /// Whether an admission may start an SGLang HiCache load-back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // Driven by the SGLang scheduler once it times load-backs.
+#[cfg_attr(not(test), allow(dead_code))] // `NoFreeSlot` is for disaggregated decode, which never loads back.
 pub(crate) enum LoadBackGate {
     /// A load slot is free: load a host hit back before allocating the suffix.
     Allow,
@@ -174,7 +174,6 @@ pub(crate) enum LoadBackGate {
 /// Result of [`SglangKvManager::admit_request_lease`].
 #[derive(Debug)]
 #[must_use = "an admitted lease and its load-back must be tracked"]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RequestAdmission {
     Admitted(AdmittedPrefix),
     /// Protected and free device capacity cannot hold the request. Pages
@@ -186,7 +185,6 @@ pub(crate) enum RequestAdmission {
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AdmittedPrefix {
     /// Cached prefix tokens, loaded host tokens included.
     pub(crate) prefix_len: usize,
@@ -459,14 +457,12 @@ impl SglangKvManager {
 
     /// Device pages copied to host by write_back eviction since the last
     /// call, for the scheduler to charge D2H time. Resets the count.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_d2h_pages(&mut self) -> usize {
         std::mem::take(&mut self.d2h_pages)
     }
 
     /// Host pages loaded back to device since the last call. Resets the
     /// count. Each [`HostLoad`] also reports its own pages.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_h2d_pages(&mut self) -> usize {
         std::mem::take(&mut self.h2d_pages)
     }
@@ -474,7 +470,6 @@ impl SglangKvManager {
     /// Complete a load-back once its H2D copy is done (SGLang
     /// `loading_check`). The request keeps its lock; the host copy stays
     /// until host eviction reclaims it, so no event is published.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish_load_back(&mut self, handle: LoadBackHandle) {
         self.cache.finish_load_back(handle);
     }
@@ -613,6 +608,7 @@ impl SglangKvManager {
     /// `max_prefix_tokens`. SGLang matches at most `input_len - 1` tokens
     /// (`Req.init_next_round_input`), so the last token of a fully cached prompt is still
     /// computed and owns its own KV slot.
+    #[cfg(test)]
     pub(crate) fn allocate_for_request_lease_capped(
         &mut self,
         token_ids: &[u32],
@@ -643,7 +639,6 @@ impl SglangKvManager {
     /// - The capacity check runs before any load, so a load never starts for a
     ///   request that cannot fit; the loaded pages are part of the request's
     ///   required pages either way.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn admit_request_lease(
         &mut self,
         token_ids: &[u32],
@@ -652,6 +647,28 @@ impl SglangKvManager {
         gate: LoadBackGate,
     ) -> RequestAdmission {
         self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate))
+    }
+
+    /// Prefix a waiting request can reuse under SGLang HiCache write_back:
+    /// the device prefix plus the host hit that [`Self::admit_request_lease`]
+    /// would load back (SGLang `init_next_round_input` -> `match_prefix`,
+    /// whose `host_hit_length` sizes the request's extend input once
+    /// `init_load_back` has run). A host hit below
+    /// `LOAD_BACK_THRESHOLD_TOKENS` is recomputed, so it does not count.
+    ///
+    /// Not read-only: like SGLang's match it may split a node at the page
+    /// boundary and refresh LRU order. It takes no lock and allocates nothing.
+    /// Write_back never opens an admission checkpoint, so nothing needs undo.
+    pub(crate) fn reusable_prefix_with_host(&mut self, page_hashes: &[LocalBlockHash]) -> usize {
+        assert!(self.is_write_back(), "host-aware match needs write_back");
+        let matched = self.cache.match_prefix_with_host_and_lock(page_hashes);
+        self.cache.dec_lock_ref(matched.last_node);
+        let host_tokens = matched.host_tokens();
+        if host_tokens >= LOAD_BACK_THRESHOLD_TOKENS {
+            matched.device_tokens + host_tokens
+        } else {
+            matched.device_tokens
+        }
     }
 
     /// `gate` is `None` for the device-only path, which ignores host hits.
