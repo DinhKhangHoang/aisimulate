@@ -167,6 +167,17 @@ impl PagePool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostPageId(usize);
 
+impl HostPageId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 /// Manages free / allocated pages for the simulated SGLang HiCache host pool.
 ///
 /// The radix core stores these indices as a node's host value but never

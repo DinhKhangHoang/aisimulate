@@ -3380,3 +3380,19 @@ fn indexed_ids_follow_chunk_cancel_completion_and_reuse() {
     core.apply_command(SchedulerCommand::Submit(request()))
         .unwrap();
 }
+
+#[test]
+fn native_host_offload_builds_a_write_back_kv_manager() {
+    let core = SglangCore::new(test_args(32, 4, 4));
+    assert!(!core.kv_manager.is_write_back());
+
+    let mut args = test_args(32, 4, 4);
+    args.enable_prefix_caching = true;
+    args.native_host_offload = Some(crate::engine::NativeHostOffloadConfig::new(24));
+    let core = SglangCore::new(args);
+    assert!(core.kv_manager.is_write_back());
+    // One AISimulate block is one SGLang page.
+    let host_pool = core.kv_manager.cache().host_pool().expect("host pool");
+    assert_eq!(host_pool.total_pages(), 24);
+    assert_eq!(core.kv_manager.cache().available_tokens(), 32 * 4);
+}

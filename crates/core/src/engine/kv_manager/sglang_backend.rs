@@ -5,7 +5,10 @@
 //! operations and KV event publishing.
 
 use crate::engine::belady::BeladyOracle;
-use crate::engine::cache::radix_cache::{KvPageId, NodeId, RadixCache};
+use crate::engine::cache::radix_cache::{
+    EvictionOutcome, HostPageEvent, HostPageId, KvPageId, LOAD_BACK_THRESHOLD_TOKENS,
+    LoadBackHandle, LoadBackResult, LoadedBack, NodeId, PrefixMatch, RadixCache,
+};
 use crate::engine::common::hashing::{
     LocalBlockHash, SequenceHash, compute_block_hash_for_seq, compute_next_seq_hash,
 };
@@ -156,6 +159,65 @@ pub(crate) struct AllocResult {
     pub(crate) lease: RadixRequestLease,
 }
 
+/// Whether an admission may start an SGLang HiCache load-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Driven by the SGLang scheduler once it times load-backs.
+pub(crate) enum LoadBackGate {
+    /// A load slot is free: load a host hit back before allocating the suffix.
+    Allow,
+    /// All load slots are busy. A host hit that SGLang would load keeps the
+    /// request waiting ([`RequestAdmission::WaitForLoadSlot`]) instead of
+    /// recomputing it; a hit below the load-back threshold is recomputed.
+    NoFreeSlot,
+}
+
+/// Result of [`SglangKvManager::admit_request_lease`].
+#[derive(Debug)]
+#[must_use = "an admitted lease and its load-back must be tracked"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RequestAdmission {
+    Admitted(AdmittedPrefix),
+    /// Protected and free device capacity cannot hold the request. Pages
+    /// may already have been evicted, as with a failed allocation.
+    NoRoom,
+    /// The request has a host hit to load but [`LoadBackGate::NoFreeSlot`]
+    /// was given. Nothing changed: no lock, allocation, eviction or event.
+    WaitForLoadSlot,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AdmittedPrefix {
+    /// Cached prefix tokens, loaded host tokens included.
+    pub(crate) prefix_len: usize,
+    /// The H2D load-back this admission started, if any. Boxed because the
+    /// handle carries two lock-release records.
+    pub(crate) load: Option<Box<HostLoad>>,
+}
+
+/// An in-flight H2D load-back started at admission. The scheduler times the
+/// copy and then passes `handle` to [`SglangKvManager::finish_load_back`].
+#[derive(Debug)]
+#[must_use = "an unfinished load-back keeps its node locked and pinned"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct HostLoad {
+    pub(crate) handle: LoadBackHandle,
+    /// Loaded tokens; they count as cached prefix tokens of the request.
+    pub(crate) tokens: usize,
+    /// Loaded pages (`tokens / page_size`).
+    pub(crate) pages: usize,
+}
+
+/// Router identity of a published block besides its sequence hash. Host
+/// residency events carry it because they are positioned
+/// (`StoredBlocks::start_position`), unlike the parent-linked device stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BlockIdentity {
+    tokens_hash: u64,
+    parent_hash: Option<SequenceHash>,
+    position: usize,
+}
+
 pub struct SglangKvManager {
     cache: RadixCache,
     enable_prefix_caching: bool,
@@ -172,6 +234,23 @@ pub struct SglangKvManager {
     /// transient slot ownership.
     block_hash_refcounts: FxHashMap<SequenceHash, usize>,
     pending_admission: Option<PendingAdmission>,
+    /// SGLang HiCache write_back state, sized only with KV events on. The
+    /// host counterpart of `page_to_block_hash`: the block hash each host
+    /// page got when a device page was copied to it.
+    host_page_to_block_hash: Vec<Option<SequenceHash>>,
+    /// Live host pages per logical block, as `block_hash_refcounts` for
+    /// the device: HostPinned Stored on 0 -> 1, Removed on 1 -> 0.
+    host_block_hash_refcounts: FxHashMap<SequenceHash, usize>,
+    /// Identity of each device page, valid while `page_to_block_hash` is
+    /// set. Write_back only: admission undo does not cover it, and write_back
+    /// never opens an admission.
+    page_identity: Vec<BlockIdentity>,
+    /// Identity of each host page, valid while `host_page_to_block_hash` is set.
+    host_page_identity: Vec<BlockIdentity>,
+    /// Device pages copied to host since the last [`Self::take_d2h_pages`].
+    d2h_pages: usize,
+    /// Host pages loaded to device since the last [`Self::take_h2d_pages`].
+    h2d_pages: usize,
 }
 
 #[must_use = "admission must be committed or rolled back"]
@@ -268,6 +347,53 @@ impl SglangKvManager {
         enable_prefix_caching: bool,
         emit_token_ids: bool,
     ) -> Self {
+        Self::build(
+            total_tokens,
+            page_size,
+            None,
+            kv_event_publishers,
+            dp_rank,
+            enable_prefix_caching,
+            emit_token_ids,
+        )
+    }
+
+    /// A prefix-caching manager whose evicted device KV is written back to
+    /// a host pool of `host_pages` pages (SGLang HiCache write_back). One
+    /// AISimulate KV block is one SGLang page, so `host_pages` is
+    /// `native_host_offload.num_host_blocks`.
+    pub(crate) fn new_write_back(
+        total_tokens: usize,
+        page_size: usize,
+        host_pages: usize,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        emit_token_ids: bool,
+    ) -> Self {
+        Self::build(
+            total_tokens,
+            page_size,
+            Some(host_pages),
+            kv_event_publishers,
+            dp_rank,
+            true,
+            emit_token_ids,
+        )
+    }
+
+    fn build(
+        total_tokens: usize,
+        page_size: usize,
+        host_pages: Option<usize>,
+        kv_event_publishers: KvEventPublishers,
+        dp_rank: u32,
+        enable_prefix_caching: bool,
+        emit_token_ids: bool,
+    ) -> Self {
+        assert!(
+            host_pages.is_none() || enable_prefix_caching,
+            "SGLang write_back host offload requires prefix caching"
+        );
         let kv_event_publishers = if enable_prefix_caching {
             kv_event_publishers
         } else {
@@ -278,8 +404,37 @@ impl SglangKvManager {
         } else {
             vec![None; total_tokens / page_size]
         };
+        let (cache, host_page_to_block_hash, page_identity, host_page_identity) = match host_pages {
+            None => (
+                RadixCache::new(total_tokens, page_size),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Some(host_pages) => {
+                let events = !kv_event_publishers.is_empty();
+                (
+                    RadixCache::new_write_back(total_tokens, page_size, host_pages),
+                    if events {
+                        vec![None; host_pages]
+                    } else {
+                        Vec::new()
+                    },
+                    if events {
+                        vec![BlockIdentity::default(); page_to_block_hash.len()]
+                    } else {
+                        Vec::new()
+                    },
+                    if events {
+                        vec![BlockIdentity::default(); host_pages]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            }
+        };
         Self {
-            cache: RadixCache::new(total_tokens, page_size),
+            cache,
             enable_prefix_caching,
             emit_token_ids,
             kv_event_publishers,
@@ -288,7 +443,40 @@ impl SglangKvManager {
             page_to_block_hash,
             block_hash_refcounts: FxHashMap::default(),
             pending_admission: None,
+            host_page_to_block_hash,
+            host_block_hash_refcounts: FxHashMap::default(),
+            page_identity,
+            host_page_identity,
+            d2h_pages: 0,
+            h2d_pages: 0,
         }
+    }
+
+    /// Whether evicted device KV is written back to an SGLang HiCache host pool.
+    pub(crate) fn is_write_back(&self) -> bool {
+        self.cache.host_pool().is_some()
+    }
+
+    /// Device pages copied to host by write_back eviction since the last
+    /// call, for the scheduler to charge D2H time. Resets the count.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_d2h_pages(&mut self) -> usize {
+        std::mem::take(&mut self.d2h_pages)
+    }
+
+    /// Host pages loaded back to device since the last call. Resets the
+    /// count. Each [`HostLoad`] also reports its own pages.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_h2d_pages(&mut self) -> usize {
+        std::mem::take(&mut self.h2d_pages)
+    }
+
+    /// Complete a load-back once its H2D copy is done (SGLang
+    /// `loading_check`). The request keeps its lock; the host copy stays
+    /// until host eviction reclaims it, so no event is published.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn finish_load_back(&mut self, handle: LoadBackHandle) {
+        self.cache.finish_load_back(handle);
     }
 
     #[cfg(test)]
@@ -306,6 +494,13 @@ impl SglangKvManager {
 
     /// Hold speculative events until the timing provider accepts the admitted batch.
     pub(crate) fn begin_admission(&mut self) -> SglangAdmission {
+        // The cache checkpoint asserts a device-only tree, and undo records
+        // neither host bookkeeping nor in-flight load-backs.
+        assert!(
+            !self.is_write_back(),
+            "SGLang KV admission checkpoints cannot snapshot HiCache write_back host state; \
+             the scheduler must not open a KV admission under native_host_offload"
+        );
         assert!(self.pending_admission.is_none(), "nested KV admission");
         self.pending_admission = Some(PendingAdmission {
             checkpoint: None,
@@ -424,6 +619,49 @@ impl SglangKvManager {
         lease: &mut RadixRequestLease,
         max_prefix_tokens: usize,
     ) -> Option<usize> {
+        match self.allocate_lease(token_ids, lease, max_prefix_tokens, None) {
+            RequestAdmission::Admitted(AdmittedPrefix {
+                prefix_len,
+                load: None,
+            }) => Some(prefix_len),
+            RequestAdmission::NoRoom => None,
+            admission => unreachable!("device-only allocation returned {admission:?}"),
+        }
+    }
+
+    /// Admit a request from the waiting queue, as
+    /// [`Self::allocate_for_request_lease_capped`] does, but load a host hit
+    /// back first under SGLang HiCache write_back (`PrefillAdder.add_one_req`
+    /// -> `init_load_back`).
+    ///
+    /// - Loaded tokens count as cached prefix tokens of the request, and the
+    ///   returned [`HostLoad`] must be finished with [`Self::finish_load_back`].
+    /// - Without write_back there is never a host hit, so this is the
+    ///   device-only allocation.
+    /// - A host hit that SGLang refuses to load (below
+    ///   `LOAD_BACK_THRESHOLD_TOKENS`, or no device room) is recomputed.
+    /// - The capacity check runs before any load, so a load never starts for a
+    ///   request that cannot fit; the loaded pages are part of the request's
+    ///   required pages either way.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn admit_request_lease(
+        &mut self,
+        token_ids: &[u32],
+        lease: &mut RadixRequestLease,
+        max_prefix_tokens: usize,
+        gate: LoadBackGate,
+    ) -> RequestAdmission {
+        self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate))
+    }
+
+    /// `gate` is `None` for the device-only path, which ignores host hits.
+    fn allocate_lease(
+        &mut self,
+        token_ids: &[u32],
+        lease: &mut RadixRequestLease,
+        max_prefix_tokens: usize,
+        gate: Option<LoadBackGate>,
+    ) -> RequestAdmission {
         assert!(!lease.is_active(), "request KV lease is already active");
         debug_assert!(lease.pages.is_empty(), "inactive KV lease retains pages");
         let page_size = self.cache.page_size();
@@ -436,9 +674,11 @@ impl SglangKvManager {
         if self.enable_prefix_caching {
             self.checkpoint_admission();
         }
-        let (prefix_len, last_node) = self.match_prefix_hashes_and_lock(matchable_hashes);
-        let required_pages = token_ids.len().div_ceil(page_size) - prefix_len / page_size;
-        let required_tokens = required_pages * page_size;
+        let matched = self.match_prefix_with_host_and_lock(matchable_hashes);
+        let mut prefix_len = matched.device_tokens;
+        let mut last_node = matched.last_node;
+        let total_pages = token_ids.len().div_ceil(page_size);
+        let required_tokens = (total_pages - prefix_len / page_size) * page_size;
 
         // Protect the matched path before making room. Otherwise an LRU
         // eviction can remove the prefix used to size this allocation, and a
@@ -446,12 +686,57 @@ impl SglangKvManager {
         let reservable = self.cache.available_tokens() + self.cache.evictable_size();
         if required_tokens > reservable {
             self.cache.dec_lock_ref(last_node);
-            return None;
+            return RequestAdmission::NoRoom;
         }
         // Without prefix caching, matching and the capacity check are read-only.
         if !self.enable_prefix_caching {
             self.checkpoint_admission();
         }
+
+        let mut load = None;
+        if let (Some(hit), Some(gate)) = (matched.host_hit, gate) {
+            match gate {
+                LoadBackGate::NoFreeSlot if hit.tokens() >= LOAD_BACK_THRESHOLD_TOKENS => {
+                    self.cache.dec_lock_ref(last_node);
+                    return RequestAdmission::WaitForLoadSlot;
+                }
+                // `load_back` would refuse it as below the threshold.
+                LoadBackGate::NoFreeSlot => {}
+                LoadBackGate::Allow => match self.cache.load_back(hit, None) {
+                    LoadBackResult::Loaded(loaded) => {
+                        let LoadedBack {
+                            pages: loaded_pages,
+                            tokens,
+                            last_node: loaded_node,
+                            eviction,
+                            handle,
+                        } = *loaded;
+                        self.publish_eviction(&eviction);
+                        self.publish_loaded_pages(
+                            &loaded_pages,
+                            materialized_hashes,
+                            prefix_len / page_size,
+                            token_ids,
+                        );
+                        self.h2d_pages += loaded_pages.len();
+                        self.log_trace("load_back", tokens);
+                        prefix_len += tokens;
+                        last_node = loaded_node;
+                        load = Some(Box::new(HostLoad {
+                            handle,
+                            tokens,
+                            pages: loaded_pages.len(),
+                        }));
+                    }
+                    // The request recomputes the host hit; the request lock
+                    // stays on the matched device node.
+                    LoadBackResult::Refused { eviction, .. } => self.publish_eviction(&eviction),
+                },
+            }
+        }
+
+        let required_pages = total_pages - prefix_len / page_size;
+        let required_tokens = required_pages * page_size;
         let available = self.cache.available_tokens();
         if required_tokens > available {
             self.evict(required_tokens - available);
@@ -460,8 +745,15 @@ impl SglangKvManager {
 
         let available_before = self.cache.available_tokens();
         let Some(mut new_pages) = self.cache.page_pool.allocate_pages(required_pages) else {
+            // Only write_back eviction can fall short of the capacity check,
+            // when a host-locked subtree stays on device. A started load
+            // cannot be undone: complete it at once so the loaded pages stay
+            // cached and unpinned.
+            if let Some(load) = load {
+                self.cache.finish_load_back(load.handle);
+            }
             self.cache.dec_lock_ref(last_node);
-            return None;
+            return RequestAdmission::NoRoom;
         };
         pages.append(&mut new_pages);
         let allocated_tokens = available_before - self.cache.available_tokens();
@@ -476,7 +768,7 @@ impl SglangKvManager {
         lease.cached_tokens = prefix_len;
         lease.admission_reused_tokens = prefix_len;
         lease.last_node = Some(last_node);
-        Some(prefix_len)
+        RequestAdmission::Admitted(AdmittedPrefix { prefix_len, load })
     }
 
     #[cfg(test)]
@@ -663,6 +955,7 @@ impl SglangKvManager {
             pages,
             false,
         );
+        self.publish_host_frees(&insert.unretained_host_pages);
         self.free_pages(&insert.unretained_pages);
         self.cache.dec_lock_ref(last_node);
     }
@@ -718,6 +1011,7 @@ impl SglangKvManager {
             "SGLang core returned a canonical suffix with the wrong length"
         );
         pages[first_new_page..suffix_end].copy_from_slice(&insert.canonical_suffix);
+        self.publish_host_frees(&insert.unretained_host_pages);
         self.free_pages(&insert.unretained_pages);
         if new_last_node != last_node {
             self.cache.dec_lock_ref(last_node);
@@ -859,6 +1153,18 @@ impl SglangKvManager {
         capacity_improved
     }
 
+    fn match_prefix_with_host_and_lock(&mut self, page_hashes: &[LocalBlockHash]) -> PrefixMatch {
+        if self.enable_prefix_caching {
+            self.cache.match_prefix_with_host_and_lock(page_hashes)
+        } else {
+            PrefixMatch {
+                device_tokens: 0,
+                last_node: self.cache.root(),
+                host_hit: None,
+            }
+        }
+    }
+
     fn match_prefix_hashes_and_lock(&mut self, page_hashes: &[LocalBlockHash]) -> (usize, NodeId) {
         if self.enable_prefix_caching {
             self.cache.match_prefix_hashes_and_lock(page_hashes)
@@ -874,10 +1180,187 @@ impl SglangKvManager {
     /// Evict tokens from the cache, publish BlockRemoved events, and log a trace.
     pub fn evict(&mut self, num_tokens: usize) {
         let outcome = self.cache.evict(num_tokens);
+        self.publish_eviction(&outcome);
+        self.log_trace("eviction", outcome.evicted_tokens);
+    }
+
+    /// Publish one cache eviction: host changes first, in their order, then
+    /// the device removals.
+    ///
+    /// Host first for two reasons. A write_back store copies the hash of a
+    /// device page that the device removal clears. And SGLang's core emits
+    /// the CPU store at `finish_write_through`, before `demote` emits the GPU
+    /// removal (UTC:4695, UTC:3220), so the block is never invisible to the
+    /// router between the two events. One call can demote several leaves;
+    /// their host events come before all of their device removals.
+    fn publish_eviction(&mut self, outcome: &EvictionOutcome) {
+        self.publish_host_events(&outcome.host_events);
         if !outcome.device_pages.is_empty() {
             self.publish_removed_pages(&outcome.device_pages);
         }
-        self.log_trace("eviction", outcome.evicted_tokens);
+    }
+
+    fn publish_host_frees(&mut self, pages: &[HostPageId]) {
+        if pages.is_empty() {
+            return;
+        }
+        let events: Vec<_> = pages.iter().copied().map(HostPageEvent::Freed).collect();
+        self.publish_host_events(&events);
+    }
+
+    /// Publish host-pool changes as `HostPinned` events, in order, and count
+    /// the D2H copies. Stores copy the device page's hash and identity;
+    /// refcounts make duplicate logical blocks publish once and remove once.
+    /// Consecutive changes of one kind share an event, and a store run is
+    /// split wherever a block does not chain to the previous one.
+    fn publish_host_events(&mut self, events: &[HostPageEvent]) {
+        self.d2h_pages += events
+            .iter()
+            .filter(|event| matches!(event, HostPageEvent::Stored { .. }))
+            .count();
+        if self.host_page_to_block_hash.is_empty() {
+            return;
+        }
+        let mut batches: Vec<KvEventData> = Vec::new();
+        for &event in events {
+            match event {
+                HostPageEvent::Stored { host, device } => {
+                    debug_assert!(
+                        self.host_page_to_block_hash[host.index()].is_none(),
+                        "host page {host:?} stored twice without a free"
+                    );
+                    let Some(block_hash) = self.page_to_block_hash[device.index()] else {
+                        continue;
+                    };
+                    let identity = self.page_identity[device.index()];
+                    self.host_page_to_block_hash[host.index()] = Some(block_hash);
+                    self.host_page_identity[host.index()] = identity;
+                    let refcount = self
+                        .host_block_hash_refcounts
+                        .entry(block_hash)
+                        .or_default();
+                    *refcount += 1;
+                    if *refcount > 1 {
+                        continue;
+                    }
+                    let block = KvBlock {
+                        block_hash,
+                        tokens_hash: identity.tokens_hash,
+                        token_ids: None,
+                    };
+                    match batches.last_mut() {
+                        Some(KvEventData::Stored(stored))
+                            if stored.blocks.last().map(|last| last.block_hash)
+                                == identity.parent_hash =>
+                        {
+                            stored.blocks.push(block);
+                        }
+                        _ => batches.push(KvEventData::Stored(StoredBlocks {
+                            parent_hash: identity.parent_hash,
+                            start_position: Some(identity.position),
+                            blocks: vec![block],
+                        })),
+                    }
+                }
+                HostPageEvent::Freed(host) => {
+                    let Some(block_hash) = self.host_page_to_block_hash[host.index()].take() else {
+                        continue;
+                    };
+                    let Entry::Occupied(mut entry) =
+                        self.host_block_hash_refcounts.entry(block_hash)
+                    else {
+                        panic!("host block {block_hash} freed without a live host page");
+                    };
+                    if *entry.get() > 1 {
+                        *entry.get_mut() -= 1;
+                        continue;
+                    }
+                    entry.remove();
+                    match batches.last_mut() {
+                        Some(KvEventData::Removed { block_hashes }) => {
+                            block_hashes.push(block_hash)
+                        }
+                        _ => batches.push(KvEventData::Removed {
+                            block_hashes: vec![block_hash],
+                        }),
+                    }
+                }
+            }
+        }
+        for data in batches {
+            let event = KvEvent {
+                event_id: self.next_event_id,
+                data,
+                dp_rank: self.dp_rank,
+                tier: KvEventTier::HostPinned,
+            };
+            self.next_event_id += 1;
+            self.publish_event(event);
+        }
+    }
+
+    /// Publish `Stored{Device}` for pages just loaded back, with the block
+    /// hashes and identities of the host pages they were copied from, at
+    /// the point SGLang's core emits the GPU store (`commit_load_back`,
+    /// UTC:4495). The host copies stay, so nothing is removed. Pages are in
+    /// prefix order from page index `first_page`.
+    fn publish_loaded_pages(
+        &mut self,
+        loaded: &[(HostPageId, KvPageId)],
+        page_hashes: &[LocalBlockHash],
+        first_page: usize,
+        token_ids: &[u32],
+    ) {
+        if self.kv_event_publishers.is_empty() {
+            return;
+        }
+        let block_size = self.cache.page_size();
+        let mut parent_hash = None;
+        let mut blocks = Vec::new();
+        for (offset, &(host, device)) in loaded.iter().enumerate() {
+            // Unhashed host pages are published by the suffix store instead.
+            let Some(block_hash) = self.host_page_to_block_hash[host.index()] else {
+                break;
+            };
+            let identity = self.host_page_identity[host.index()];
+            let page_idx = first_page + offset;
+            debug_assert_eq!(identity.position, page_idx);
+            debug_assert_eq!(identity.tokens_hash, page_hashes[page_idx].0);
+            debug_assert!(self.page_to_block_hash[device.index()].is_none());
+            self.page_to_block_hash[device.index()] = Some(block_hash);
+            self.page_identity[device.index()] = identity;
+            let refcount = self.block_hash_refcounts.entry(block_hash).or_default();
+            *refcount += 1;
+            // As in `publish_stored_hashes`: the batch starts at the first
+            // newly visible block and keeps every block after it.
+            if *refcount == 1 && blocks.is_empty() {
+                parent_hash = identity.parent_hash;
+            }
+            if *refcount == 1 || !blocks.is_empty() {
+                blocks.push(KvBlock {
+                    block_hash,
+                    tokens_hash: identity.tokens_hash,
+                    token_ids: self.emit_token_ids.then(|| {
+                        token_ids[page_idx * block_size..(page_idx + 1) * block_size].to_vec()
+                    }),
+                });
+            }
+        }
+        if blocks.is_empty() {
+            return;
+        }
+        let event = KvEvent {
+            event_id: self.next_event_id,
+            data: KvEventData::Stored(StoredBlocks {
+                parent_hash,
+                start_position: None,
+                blocks,
+            }),
+            dp_rank: self.dp_rank,
+            tier: KvEventTier::Device,
+        };
+        self.next_event_id += 1;
+        self.publish_event(event);
     }
 
     fn free_pages(&mut self, pages: &[KvPageId]) {
@@ -978,6 +1461,13 @@ impl SglangKvManager {
                 },
             );
             self.page_to_block_hash[page_slot] = Some(block_hash);
+            if let Some(identity) = self.page_identity.get_mut(page_slot) {
+                *identity = BlockIdentity {
+                    tokens_hash: tokens_hash.0,
+                    parent_hash: block_parent_hash,
+                    position: page_idx,
+                };
+            }
             let refcount = entry.or_default();
             *refcount += 1;
             if *refcount == 1 && !publishing {
@@ -2011,5 +2501,429 @@ mod tests {
             alloc2.prefix_len, chunk1_len,
             "second chunk should reuse the cached partial prefix"
         );
+    }
+
+    fn write_back_manager(
+        total_tokens: usize,
+        host_pages: usize,
+        sink: &Arc<MockSink>,
+    ) -> SglangKvManager {
+        SglangKvManager::new_write_back(
+            total_tokens,
+            4,
+            host_pages,
+            KvEventPublishers::new(Some(sink.clone())),
+            0,
+            false,
+        )
+    }
+
+    fn seq(start: u32, len: usize) -> Vec<u32> {
+        (start..start + len as u32).collect()
+    }
+
+    fn cache_prompt(mgr: &mut SglangKvManager, tokens: &[u32]) {
+        let alloc = mgr.allocate_for_request(tokens).unwrap();
+        mgr.finish(tokens, alloc.lease);
+    }
+
+    /// Admit like SGLang's prefill adder: match at most `len - 1` tokens.
+    fn admit(
+        mgr: &mut SglangKvManager,
+        tokens: &[u32],
+        gate: LoadBackGate,
+    ) -> (RequestAdmission, RadixRequestLease) {
+        let mut lease = RadixRequestLease::default();
+        let admission = mgr.admit_request_lease(tokens, &mut lease, tokens.len() - 1, gate);
+        (admission, lease)
+    }
+
+    fn stored(event: &KvEvent, tier: KvEventTier) -> &StoredBlocks {
+        assert_eq!(event.tier, tier, "unexpected tier for {event:?}");
+        let KvEventData::Stored(stored) = &event.data else {
+            panic!("expected Stored, got {event:?}");
+        };
+        stored
+    }
+
+    fn removed(event: &KvEvent, tier: KvEventTier) -> &[u64] {
+        assert_eq!(event.tier, tier, "unexpected tier for {event:?}");
+        let KvEventData::Removed { block_hashes } = &event.data else {
+            panic!("expected Removed, got {event:?}");
+        };
+        block_hashes
+    }
+
+    fn block_hashes(stored: &StoredBlocks) -> Vec<u64> {
+        stored.blocks.iter().map(|block| block.block_hash).collect()
+    }
+
+    fn assert_event_ids_are_dense(sink: &MockSink) {
+        for (index, event) in sink.clone_events().iter().enumerate() {
+            assert_eq!(event.event_id, index as u64);
+        }
+    }
+
+    /// Design test 7: A write_back demote publishes the host store before the device
+    /// removal, with the same block hashes and the router identity of the
+    /// device blocks.
+    #[test]
+    fn write_back_demote_publishes_host_store_then_device_removal() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(16, 8, &sink);
+        cache_prompt(&mut mgr, &seq(1, 12));
+        let device_store = stored(&sink.clone_events()[0], KvEventTier::Device).clone();
+        assert_eq!(mgr.take_d2h_pages(), 0);
+
+        // Only one page is free, so the whole three-page leaf is demoted.
+        let other = seq(100, 12);
+        let alloc = mgr.allocate_for_request(&other).unwrap();
+        let events = sink.clone_events();
+        assert_eq!(events.len(), 4, "{events:?}");
+        let host_store = stored(&events[1], KvEventTier::HostPinned);
+        assert_eq!(block_hashes(host_store), block_hashes(&device_store));
+        assert_eq!(host_store.parent_hash, None);
+        assert_eq!(host_store.start_position, Some(0));
+        let tokens_hashes = |stored: &StoredBlocks| -> Vec<u64> {
+            stored
+                .blocks
+                .iter()
+                .map(|block| block.tokens_hash)
+                .collect()
+        };
+        assert_eq!(tokens_hashes(host_store), tokens_hashes(&device_store));
+        assert_eq!(
+            removed(&events[2], KvEventTier::Device),
+            block_hashes(&device_store)
+        );
+        stored(&events[3], KvEventTier::Device);
+        assert_event_ids_are_dense(&sink);
+        assert_eq!(mgr.take_d2h_pages(), 3);
+        assert_eq!(mgr.take_d2h_pages(), 0, "the counter drains");
+        assert_eq!(mgr.take_h2d_pages(), 0);
+        mgr.finish(&other, alloc.lease);
+    }
+
+    /// Design test 8: Making host room for a new demote publishes Removed{HostPinned}
+    /// for the evicted host copy, before the new host store.
+    #[test]
+    fn write_back_host_eviction_publishes_host_removed() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(16, 3, &sink);
+        let first = seq(1, 12);
+        cache_prompt(&mut mgr, &first);
+        cache_prompt(&mut mgr, &seq(100, 12)); // Demotes `first`; the host is full.
+        let events = sink.clone_events();
+        let first_hashes = block_hashes(stored(&events[0], KvEventTier::Device));
+        let second_hashes = block_hashes(stored(&events[3], KvEventTier::Device));
+        assert_eq!(mgr.take_d2h_pages(), 3);
+
+        let third = seq(200, 12);
+        let alloc = mgr.allocate_for_request(&third).unwrap();
+        let events = sink.clone_events();
+        assert_eq!(events.len(), 8, "{events:?}");
+        assert_eq!(removed(&events[4], KvEventTier::HostPinned), first_hashes);
+        assert_eq!(
+            block_hashes(stored(&events[5], KvEventTier::HostPinned)),
+            second_hashes
+        );
+        assert_eq!(removed(&events[6], KvEventTier::Device), second_hashes);
+        stored(&events[7], KvEventTier::Device);
+        assert_event_ids_are_dense(&sink);
+        assert_eq!(mgr.take_d2h_pages(), 3);
+        for hash in &first_hashes {
+            assert!(!mgr.host_block_hash_refcounts.contains_key(hash));
+        }
+        mgr.finish(&third, alloc.lease);
+    }
+
+    /// Design test 9: A load-back publishes Stored{Device} with the host hashes and keeps
+    /// the HostPinned copy; reclaiming that copy later publishes its removal
+    /// while the device copy stays.
+    #[test]
+    fn load_back_publishes_device_store_and_keeps_host_copy_until_reclaim() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(20, 3, &sink);
+        let first = seq(1, 12);
+        cache_prompt(&mut mgr, &first);
+        cache_prompt(&mut mgr, &seq(100, 12)); // Demotes `first`; the host is full.
+        let events = sink.clone_events();
+        let first_hashes = block_hashes(stored(&events[0], KvEventTier::Device));
+        let second_hashes = block_hashes(stored(&events[3], KvEventTier::Device));
+        assert_eq!(
+            block_hashes(stored(&events[1], KvEventTier::HostPinned)),
+            first_hashes
+        );
+        mgr.take_d2h_pages();
+        let mark = sink.event_count();
+
+        let mut prompt = first.clone();
+        prompt.push(13);
+        let (admission, lease) = admit(&mut mgr, &prompt, LoadBackGate::Allow);
+        let RequestAdmission::Admitted(AdmittedPrefix {
+            prefix_len,
+            load: Some(load),
+        }) = admission
+        else {
+            panic!("expected a load-back, got {admission:?}");
+        };
+        assert_eq!(prefix_len, 12);
+        assert_eq!((load.tokens, load.pages), (12, 3));
+        assert_eq!(lease.cached_tokens(), 12);
+        assert_eq!(lease.admission_reused_tokens(), 12);
+        assert_eq!(lease.page_count(), 4);
+        assert_eq!(mgr.take_h2d_pages(), 3);
+        // The host copy of `first` is pinned by the load, so the second
+        // prompt cannot be backed up and is dropped.
+        assert_eq!(mgr.take_d2h_pages(), 0);
+
+        let events = sink.clone_events();
+        assert_eq!(events.len(), mark + 2, "{:?}", &events[mark..]);
+        assert_eq!(removed(&events[mark], KvEventTier::Device), second_hashes);
+        let loaded = stored(&events[mark + 1], KvEventTier::Device);
+        assert_eq!(block_hashes(loaded), first_hashes);
+        assert_eq!(loaded.parent_hash, None);
+        assert_eq!(loaded.start_position, None);
+        let host_hashes = mgr
+            .host_page_to_block_hash
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(host_hashes, first_hashes, "the host copy stays");
+        let loaded_pages = &lease.pages()[..3];
+        assert_eq!(
+            loaded_pages
+                .iter()
+                .map(|page| mgr.page_to_block_hash[page.index()].unwrap())
+                .collect::<Vec<_>>(),
+            first_hashes
+        );
+
+        // A one-page leaf cached before the request finishes is the LRU leaf.
+        let small = seq(300, 4);
+        cache_prompt(&mut mgr, &small);
+        let small_hash = block_hashes(stored(
+            sink.clone_events().last().unwrap(),
+            KvEventTier::Device,
+        ));
+        mgr.finish_load_back(load.handle);
+        mgr.finish(&prompt, lease);
+        let mark = sink.event_count();
+
+        // Backing up `small` needs host room: the coexisting host copy of
+        // `first` is reclaimed, and its device copy stays.
+        let next = seq(400, 8);
+        let alloc = mgr.allocate_for_request(&next).unwrap();
+        let events = sink.clone_events();
+        assert_eq!(events.len(), mark + 4, "{:?}", &events[mark..]);
+        assert_eq!(
+            removed(&events[mark], KvEventTier::HostPinned),
+            first_hashes
+        );
+        assert_eq!(
+            block_hashes(stored(&events[mark + 1], KvEventTier::HostPinned)),
+            small_hash
+        );
+        assert_eq!(removed(&events[mark + 2], KvEventTier::Device), small_hash);
+        stored(&events[mark + 3], KvEventTier::Device);
+        assert_eq!(mgr.cache().prefix_match_len(&first), 12);
+        assert_event_ids_are_dense(&sink);
+        mgr.finish(&next, alloc.lease);
+    }
+
+    /// Design test 10: Duplicate logical blocks on host publish once and remove once.
+    #[test]
+    fn duplicate_host_blocks_publish_once_and_remove_once() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(32, 8, &sink);
+        let tokens = seq(1, 12);
+        let first = mgr.allocate_for_request(&tokens).unwrap();
+        let second = mgr.allocate_for_request(&tokens).unwrap();
+        assert_eq!(sink.event_count(), 1);
+
+        let host = |index| HostPageId::from_index(index);
+        let stores = |offset: usize, lease: &RadixRequestLease| -> Vec<HostPageEvent> {
+            lease
+                .pages()
+                .iter()
+                .take(3)
+                .enumerate()
+                .map(|(index, &device)| HostPageEvent::Stored {
+                    host: host(offset + index),
+                    device,
+                })
+                .collect()
+        };
+        mgr.publish_host_events(&stores(0, &first.lease));
+        mgr.publish_host_events(&stores(3, &second.lease));
+        let events = sink.clone_events();
+        assert_eq!(events.len(), 2, "the duplicate host store is silent");
+        let host_store = stored(&events[1], KvEventTier::HostPinned);
+        assert_eq!(host_store.blocks.len(), 3);
+        assert_eq!(mgr.take_d2h_pages(), 6);
+
+        let frees = |offset: usize| -> Vec<HostPageEvent> {
+            (offset..offset + 3)
+                .map(|index| HostPageEvent::Freed(host(index)))
+                .collect()
+        };
+        mgr.publish_host_events(&frees(0));
+        assert_eq!(sink.event_count(), 2, "one host copy remains");
+        mgr.publish_host_events(&frees(3));
+        let events = sink.clone_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            removed(&events[2], KvEventTier::HostPinned),
+            block_hashes(host_store)
+        );
+        assert!(mgr.host_block_hash_refcounts.is_empty());
+        assert!(mgr.host_page_to_block_hash.iter().all(Option::is_none));
+        mgr.abort(first.lease);
+        mgr.abort(second.lease);
+    }
+
+    /// Design test 11: Without a free load slot, a loadable host hit keeps the request
+    /// waiting and leaves no event, lock or allocation behind.
+    #[test]
+    fn load_back_without_slot_waits_without_side_effects() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(20, 3, &sink);
+        let first = seq(1, 12);
+        cache_prompt(&mut mgr, &first);
+        cache_prompt(&mut mgr, &seq(100, 12));
+        mgr.take_d2h_pages();
+        let mark = sink.event_count();
+        let before = (
+            mgr.cache().available_tokens(),
+            mgr.cache().evictable_size(),
+            mgr.cache().protected_size(),
+        );
+
+        let mut prompt = first.clone();
+        prompt.push(13);
+        let (admission, lease) = admit(&mut mgr, &prompt, LoadBackGate::NoFreeSlot);
+        assert!(
+            matches!(admission, RequestAdmission::WaitForLoadSlot),
+            "{admission:?}"
+        );
+        assert!(!lease.is_active());
+        assert_eq!(lease.page_count(), 0);
+        assert_eq!(sink.event_count(), mark);
+        assert_eq!(
+            (
+                mgr.cache().available_tokens(),
+                mgr.cache().evictable_size(),
+                mgr.cache().protected_size(),
+            ),
+            before
+        );
+        assert_eq!((mgr.take_d2h_pages(), mgr.take_h2d_pages()), (0, 0));
+
+        // The waiting request loads once a slot is free.
+        let (admission, lease) = admit(&mut mgr, &prompt, LoadBackGate::Allow);
+        let RequestAdmission::Admitted(AdmittedPrefix {
+            prefix_len: 12,
+            load: Some(load),
+        }) = admission
+        else {
+            panic!("expected a load-back, got {admission:?}");
+        };
+        mgr.finish_load_back(load.handle);
+        mgr.finish(&prompt, lease);
+        assert_eq!(mgr.cache().protected_size(), 0);
+    }
+
+    /// A host hit below SGLang's load-back threshold is recomputed, so it
+    /// never waits for a load slot.
+    #[test]
+    fn short_host_hit_is_recomputed_with_or_without_a_slot() {
+        for gate in [LoadBackGate::Allow, LoadBackGate::NoFreeSlot] {
+            let sink = Arc::new(MockSink::new());
+            let mut mgr = write_back_manager(12, 4, &sink);
+            let first = seq(1, 8);
+            cache_prompt(&mut mgr, &first);
+            cache_prompt(&mut mgr, &seq(100, 8)); // Demotes `first`.
+            mgr.take_d2h_pages();
+
+            let mut prompt = first.clone();
+            prompt.push(9);
+            let (admission, lease) = admit(&mut mgr, &prompt, gate);
+            let RequestAdmission::Admitted(AdmittedPrefix {
+                prefix_len: 0,
+                load: None,
+            }) = admission
+            else {
+                panic!("expected a recompute, got {admission:?}");
+            };
+            assert_eq!(lease.cached_tokens(), 0);
+            assert_eq!(mgr.take_h2d_pages(), 0);
+            assert!(
+                sink.clone_events()
+                    .iter()
+                    .all(|event| event.tier == KvEventTier::Device
+                        || matches!(event.data, KvEventData::Stored(_))),
+                "the short host copy is not removed"
+            );
+            mgr.finish(&prompt, lease);
+            assert_eq!(mgr.cache().protected_size(), 0);
+        }
+    }
+
+    /// Insert-time host frees publish Removed{HostPinned} like eviction frees.
+    #[test]
+    fn insert_host_frees_publish_host_removed() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(32, 8, &sink);
+        let tokens = seq(1, 4);
+        let alloc = mgr.allocate_for_request(&tokens).unwrap();
+        let hash = mgr.page_to_block_hash[alloc.lease.pages()[0].index()].unwrap();
+        mgr.publish_host_events(&[HostPageEvent::Stored {
+            host: HostPageId::from_index(0),
+            device: alloc.lease.pages()[0],
+        }]);
+        mgr.publish_host_frees(&[HostPageId::from_index(0)]);
+        let events = sink.clone_events();
+        assert_eq!(removed(&events[2], KvEventTier::HostPinned), [hash]);
+        mgr.abort(alloc.lease);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot snapshot HiCache write_back host state")]
+    fn write_back_rejects_admission_checkpoints() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = write_back_manager(16, 4, &sink);
+        let _admission = mgr.begin_admission();
+    }
+
+    /// Without write_back the admission call is the device-only allocation.
+    #[test]
+    fn admission_without_write_back_matches_device_allocation() {
+        let sink = Arc::new(MockSink::new());
+        let mut mgr = SglangKvManager::new(16, 4, KvEventPublishers::new(Some(sink.clone())), 0);
+        assert!(!mgr.is_write_back());
+        let tokens = seq(1, 12);
+        cache_prompt(&mut mgr, &tokens);
+        let mut prompt = tokens.clone();
+        prompt.push(13);
+        for gate in [LoadBackGate::NoFreeSlot, LoadBackGate::Allow] {
+            let (admission, lease) = admit(&mut mgr, &prompt, gate);
+            let RequestAdmission::Admitted(AdmittedPrefix {
+                prefix_len: 12,
+                load: None,
+            }) = admission
+            else {
+                panic!("expected a device hit, got {admission:?}");
+            };
+            mgr.abort(lease);
+        }
+        let mut lease = RadixRequestLease::default();
+        let too_long = seq(1, 20);
+        assert!(matches!(
+            mgr.admit_request_lease(&too_long, &mut lease, 19, LoadBackGate::Allow),
+            RequestAdmission::NoRoom
+        ));
+        assert_eq!(mgr.cache().protected_size(), 0);
+        assert_eq!((mgr.take_d2h_pages(), mgr.take_h2d_pages()), (0, 0));
     }
 }
