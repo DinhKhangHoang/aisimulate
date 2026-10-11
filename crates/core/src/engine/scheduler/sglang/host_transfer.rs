@@ -118,6 +118,27 @@ mod tests {
         assert_eq!(clock.pages(), (3, 0));
     }
 
+    /// TTFB overlaps queueing: a transfer is ready `ttfb` after it is issued
+    /// and then waits for the lane, so behind a busy lane its TTFB is hidden.
+    /// It does not occupy the lane per transfer, which would serialize it.
+    #[test]
+    fn ttfb_overlaps_a_busy_lane_instead_of_occupying_it() {
+        let mut clock = clock(1.0, 1.0, 1.0);
+        // Ready at 1, 4 MB at 1 GB/s = 4 ms.
+        assert_eq!(clock.load(0.0, 4), 5.0);
+        // Ready at 1 but the lane is busy until 5: 6, not 7.
+        assert_eq!(clock.load(0.0, 1), 6.0);
+        // Issued at 3 and ready at 4, still behind the lane: 7, not 8.
+        assert_eq!(clock.load(3.0, 1), 7.0);
+        // An idle lane pays the full TTFB again.
+        assert_eq!(clock.load(10.0, 1), 12.0);
+        // The D2H lane follows the same rule.
+        clock.write_back(0.0, 4);
+        clock.write_back(0.0, 1);
+        assert_eq!(clock.compute_start(0.0), 6.0);
+        assert_eq!(clock.pages(), (5, 7));
+    }
+
     #[test]
     fn directions_are_independent_and_zero_bandwidth_is_unlimited() {
         let mut clock = clock(1.0, 0.0, 0.0);
