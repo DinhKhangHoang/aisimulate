@@ -272,6 +272,131 @@ impl EvictionOutcome {
     }
 }
 
+/// Smallest Full-KV load-back SGLang performs, in tokens: shorter host hits
+/// are recomputed instead (`UnifiedRadixCache.load_back_threshold`, URC:515,
+/// applied as `max(1, threshold)` in `_load_back_transfers`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LOAD_BACK_THRESHOLD_TOKENS: usize = 10;
+
+/// Load-backs SGLang keeps in flight at once. `has_free_load_back_slot`
+/// (URC:3545-3549) compares the load ack queue with
+/// `LayerDoneCounter.num_counters`, fixed at 3 ("extra producer and consumer
+/// counters for overlap mode", `LayerDoneCounter.__init__` in
+/// managers/cache_controller.py). A fourth load waits for a slot rather than
+/// falling back to recompute. The scheduler enforces it; the cache does not.
+#[allow(dead_code)] // Read by the SGLang scheduler once it drives load-back.
+pub(crate) const MAX_LOAD_BACK_IN_FLIGHT: usize = 3;
+
+/// A prefix match that also reports the host-only continuation of the
+/// device prefix (SGLang `MatchResult` under HiCache, URC:552-568).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefixMatch {
+    /// Device-resident prefix, in tokens.
+    pub(crate) device_tokens: usize,
+    /// Deepest device node on the prefix. It carries the request lock.
+    pub(crate) last_node: NodeId,
+    /// The host-only prefix after `device_tokens`, if any.
+    pub(crate) host_hit: Option<HostHit>,
+}
+
+impl PrefixMatch {
+    /// Host-only prefix after the device prefix, in tokens.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn host_tokens(&self) -> usize {
+        self.host_hit.map_or(0, |hit| hit.tokens)
+    }
+}
+
+/// Opaque load-back anchor from [`RadixCache::match_prefix_with_host_and_lock`]:
+/// SGLang's `best_match_node` plus the device node the request locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostHit {
+    tokens: usize,
+    best_node: NodeId,
+    request_node: NodeId,
+}
+
+impl HostHit {
+    /// Host-only prefix tokens (SGLang `host_hit_length` times page size).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn tokens(&self) -> usize {
+        self.tokens
+    }
+}
+
+/// Why [`RadixCache::load_back`] declined; the request recomputes the host hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum LoadBackRefusal {
+    /// The anchor is gone or already back on device; match again.
+    Stale,
+    /// Fewer than [`LOAD_BACK_THRESHOLD_TOKENS`] tokens to load.
+    BelowThreshold,
+    /// The load plus the newly protected prefix exceeds the caller's quota.
+    OverQuota,
+    /// Eviction could not free enough device pages.
+    NoDeviceRoom,
+}
+
+/// Result of [`RadixCache::load_back`].
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum LoadBackResult {
+    /// Boxed: the lock receipts make it much larger than a refusal.
+    Loaded(Box<LoadedBack>),
+    Refused {
+        reason: LoadBackRefusal,
+        /// Write_back eviction done before the refusal. Its pages have moved
+        /// even though nothing was loaded, so the caller must publish it.
+        eviction: EvictionOutcome,
+    },
+}
+
+/// A committed H->D load-back.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LoadedBack {
+    /// Each loaded device page with the host page it is copied from, in
+    /// prefix order (ancestors first).
+    pub(crate) pages: Vec<(HostPageId, KvPageId)>,
+    /// Loaded tokens (`pages.len() * page_size`).
+    pub(crate) tokens: usize,
+    /// The loaded node. The request lock has moved here from the matched
+    /// device node; the request prefix is now `device_tokens + tokens` long.
+    pub(crate) last_node: NodeId,
+    /// Write_back eviction done to make device room; may be empty.
+    pub(crate) eviction: EvictionOutcome,
+    /// Pass to [`RadixCache::finish_load_back`] when the H2D copy completes.
+    pub(crate) handle: LoadBackHandle,
+}
+
+/// An in-flight load-back (SGLang `_OngoingLoadBack`, URC:1838-1842): the
+/// device and host lock receipts on the anchor, released by
+/// [`RadixCache::finish_load_back`].
+#[must_use = "an unfinished load-back keeps its node locked and pinned"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LoadBackHandle {
+    anchor: NodeId,
+    lock: DecLockRefParams,
+    host_lock: DecLockRefParams,
+}
+
+impl LoadBackHandle {
+    /// The loaded node this load-back is anchored on.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn node(&self) -> NodeId {
+        self.anchor
+    }
+}
+
+impl std::fmt::Debug for LoadBackHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadBackHandle")
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) struct InsertPageResult {
     pub(crate) last_node: NodeId,
     pub(crate) canonical_suffix: Vec<KvPageId>,
@@ -567,10 +692,27 @@ impl RadixCache {
     }
 
     /// Match and protect a prefix using page hashes already owned by the request.
+    ///
+    /// Device-only: a host-only continuation is ignored. See
+    /// [`Self::match_prefix_with_host_and_lock`] for the host hit.
     pub(crate) fn match_prefix_hashes_and_lock(
         &mut self,
         page_keys: &[LocalBlockHash],
     ) -> (usize, NodeId) {
+        let matched = self.match_prefix_with_host_and_lock(page_keys);
+        (matched.device_tokens, matched.last_node)
+    }
+
+    /// Match a prefix, lock its device part for the request, and report the
+    /// host-only continuation that [`Self::load_back`] can bring back.
+    ///
+    /// The request lock sits on the deepest device node, like SGLang's
+    /// `req.last_node` before `init_load_back`. Without write_back, or when
+    /// nothing past the device prefix is on host, `host_hit` is `None`.
+    pub(crate) fn match_prefix_with_host_and_lock(
+        &mut self,
+        page_keys: &[LocalBlockHash],
+    ) -> PrefixMatch {
         let key: PageKey = page_keys.to_vec().into();
         let result = self.tree.match_prefix(&MatchPrefixParams {
             key: &key,
@@ -578,19 +720,197 @@ impl RadixCache {
         });
         // A Full-only match can only emit the split fix-up for a pending
         // write-through ack, and write_back acks each backup inside the same
-        // `evict()` call. Under write_back the match may also end on host-only
-        // nodes (`host_hit_length`); this device-only path ignores them and
-        // locks the deepest device node, as SGLang does before load-back.
+        // `evict()` call.
         assert!(
             result.cache_actions.is_empty(),
             "Full-only device match unexpectedly produced cache actions"
         );
         let last_node = result.last_device_node_id;
-        let matched_tokens = result.device_indices.as_slice().len() * self.page_size;
+        let device_tokens = result.device_indices.as_slice().len() * self.page_size;
         self.tree
             .inc_lock_ref(last_node, ComponentSet::EMPTY)
             .expect("live prefix");
-        (matched_tokens, last_node)
+        let host_hit = (result.host_hit_length > 0).then(|| HostHit {
+            tokens: result.host_hit_length * self.page_size,
+            best_node: result.best_match_node_id,
+            request_node: last_node,
+        });
+        PrefixMatch {
+            device_tokens,
+            last_node,
+            host_hit,
+        }
+    }
+
+    /// Start an H->D load-back of a host hit, following SGLang
+    /// `init_load_back` -> `load_back` -> `_load_back_transfers`
+    /// (URC:3412-3457, URC:1730-1842).
+    ///
+    /// Call it right after the match that produced `hit`, while the request
+    /// still holds that match's lock. `mem_quota` is in tokens; `None` means
+    /// no quota, as in SGLang.
+    ///
+    /// Locks, as in URC:
+    /// 1. A host lock and a device lock on the anchor (`best_match_node`). The
+    ///    device lock covers the evicted segment and its device ancestors, so
+    ///    the eviction below cannot take them; the host lock keeps host
+    ///    eviction off the anchor's host copy.
+    /// 2. On refusal both are released and nothing else changes; the request
+    ///    keeps its lock on the matched device node.
+    /// 3. On success the device lock is released just before
+    ///    `commit_load_back`, and a new device lock on the now device-resident
+    ///    anchor is taken for the in-flight load. That lock and the host lock
+    ///    go into the [`LoadBackHandle`]; `commit_load_back` also pins the
+    ///    loaded nodes against demote and coexist reclaim until
+    ///    [`Self::finish_load_back`].
+    /// 4. The request lock then moves to the anchor: lock the anchor, then
+    ///    release the matched device node. SGLang does the same in
+    ///    `PrefillAdder.add_one_req`: `init_load_back` returns the anchor as
+    ///    the new `req.last_node`, `_req_inc_lock_ref` locks it, and the
+    ///    temporary `_lock_node` on the old `last_node` is released. The
+    ///    request's prefix pages are then `collect_path_pages_through(
+    ///    last_node, device_tokens + tokens)`, exactly as for a device hit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn load_back(&mut self, hit: HostHit, mem_quota: Option<usize>) -> LoadBackResult {
+        assert!(
+            self.host_pool.is_some(),
+            "load-back needs SGLang write_back"
+        );
+        let refused = |reason| LoadBackResult::Refused {
+            reason,
+            eviction: EvictionOutcome::default(),
+        };
+        let best = hit.best_node;
+        if !matches!(self.tree.is_full_device_evicted(best), Ok(true)) {
+            return refused(LoadBackRefusal::Stale);
+        }
+
+        let host_lock = self
+            .tree
+            .inc_host_lock_ref(best)
+            .expect("live load-back anchor")
+            .to_dec_params();
+        let lock = self
+            .tree
+            .inc_lock_ref(best, ComponentSet::EMPTY)
+            .expect("live load-back anchor");
+        let newly_protected = lock.delta.unwrap_or(0) * self.page_size;
+        let lock = lock.to_dec_params();
+
+        let (kv_xfer, comp_xfers) = self
+            .tree
+            .build_load_back_spec(best, None)
+            .expect("live load-back anchor");
+        assert!(
+            comp_xfers.is_empty(),
+            "Full-only tree has no auxiliary load-back transfers"
+        );
+        // Empty when another in-flight load-back pins one of the nodes.
+        let host_pages: Vec<HostPageId> = kv_xfer
+            .host_indices
+            .as_ref()
+            .map(|value| host_pages_of(value).collect())
+            .unwrap_or_default();
+        let tokens = host_pages.len() * self.page_size;
+        let refusal = if tokens < LOAD_BACK_THRESHOLD_TOKENS.max(1) {
+            Some(LoadBackRefusal::BelowThreshold)
+        } else if mem_quota.is_some_and(|quota| tokens + newly_protected > quota) {
+            Some(LoadBackRefusal::OverQuota)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            self.release_load_back_locks(best, &lock, &host_lock);
+            return refused(reason);
+        }
+
+        let mut eviction = EvictionOutcome::default();
+        let available = self.page_pool.available();
+        if available < tokens {
+            eviction = self.evict(tokens - available);
+            if self.page_pool.available() < tokens {
+                self.release_load_back_locks(best, &lock, &host_lock);
+                return LoadBackResult::Refused {
+                    reason: LoadBackRefusal::NoDeviceRoom,
+                    eviction,
+                };
+            }
+        }
+        let device_pages = self
+            .page_pool
+            .allocate_pages(host_pages.len())
+            .expect("device room was just checked");
+
+        self.tree
+            .dec_lock_ref(best, &lock, false)
+            .expect("live load-back anchor");
+        let actions = self
+            .tree
+            .commit_load_back(
+                best,
+                PageValue::from_vec(device_pages.clone()),
+                kv_xfer,
+                comp_xfers,
+            )
+            .expect("live load-back anchor");
+        assert!(
+            actions.is_empty(),
+            "Full-only load-back unexpectedly produced cache actions"
+        );
+        let lock = self
+            .tree
+            .inc_lock_ref(best, ComponentSet::EMPTY)
+            .expect("loaded anchor")
+            .to_dec_params();
+
+        // Move the request lock to the loaded node.
+        self.inc_lock_ref(best);
+        self.dec_lock_ref(hit.request_node);
+
+        LoadBackResult::Loaded(Box::new(LoadedBack {
+            pages: host_pages.into_iter().zip(device_pages).collect(),
+            tokens,
+            last_node: best,
+            eviction,
+            handle: LoadBackHandle {
+                anchor: best,
+                lock,
+                host_lock,
+            },
+        }))
+    }
+
+    /// Complete a load-back once its H2D copy is done, as SGLang
+    /// `loading_check` does (URC:3356-3408): release the in-flight device
+    /// lock and the host lock, then unpin the loaded nodes. The host copy
+    /// stays as a coexisting duplicate that host eviction reclaims first.
+    /// The request lock taken by [`Self::load_back`] is not touched.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn finish_load_back(&mut self, handle: LoadBackHandle) {
+        let LoadBackHandle {
+            anchor,
+            lock,
+            host_lock,
+        } = handle;
+        self.release_load_back_locks(anchor, &lock, &host_lock);
+        self.tree
+            .finish_load_back(anchor)
+            .expect("live load-back anchor");
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn release_load_back_locks(
+        &mut self,
+        anchor: NodeId,
+        lock: &DecLockRefParams,
+        host_lock: &DecLockRefParams,
+    ) {
+        self.tree
+            .dec_lock_ref(anchor, lock, false)
+            .expect("live load-back anchor");
+        self.tree
+            .dec_host_lock_ref(anchor, host_lock)
+            .expect("live load-back anchor");
     }
 
     #[cfg(test)]
@@ -1262,7 +1582,16 @@ mod tests {
 
     /// Every page is either free or held by exactly one tree node, on both tiers.
     fn assert_pool_accounting(cache: &RadixCache) {
-        cache.tree.sanity_check(&[], &[]);
+        assert_pool_accounting_with_loads(cache, &[]);
+    }
+
+    /// As [`assert_pool_accounting`], with the anchors of in-flight load-backs.
+    fn assert_pool_accounting_with_loads(cache: &RadixCache, pending: &[&LoadBackHandle]) {
+        let ongoing: Vec<_> = pending
+            .iter()
+            .map(|handle| (handle.node() as i64, handle.node()))
+            .collect();
+        cache.tree.sanity_check(&[], &ongoing);
         let mut device = Vec::new();
         let mut host = Vec::new();
         for node in cache.tree.inspect_get_all_node_ids() {
@@ -1499,57 +1828,408 @@ mod tests {
         use rand::{Rng, SeedableRng};
 
         let mut rng = StdRng::seed_from_u64(0x5eed);
-        let mut cache = RadixCache::new_write_back(24, 2, 10);
+        // Four-token pages: a host hit of three pages clears the load-back threshold.
+        let mut cache = RadixCache::new_write_back(48, 4, 16);
         let mut locked: Vec<NodeId> = Vec::new();
+        let mut pending: Vec<LoadBackHandle> = Vec::new();
+        let prompts: Vec<Vec<LocalBlockHash>> = (0..6)
+            .map(|_| {
+                (0..8)
+                    .map(|page| LocalBlockHash(rng.random_range(1..=if page < 2 { 2 } else { 6 })))
+                    .collect()
+            })
+            .collect();
         let mut inserted: Vec<Vec<LocalBlockHash>> = Vec::new();
-        let mut demotes = 0;
-        let mut host_frees = 0;
+        let (mut demotes, mut host_frees) = (0, 0);
+        let (mut loads, mut refusals, mut finishes) = (0, 0, 0);
+        let mut absorb = |outcome: &EvictionOutcome, page_size: usize| {
+            assert_eq!(
+                outcome.evicted_tokens,
+                outcome.device_pages.len() * page_size
+            );
+            for (_, device) in outcome.stored_host() {
+                assert!(outcome.device_pages.contains(&device));
+            }
+            demotes += outcome.stored_host().count();
+            host_frees += outcome.host_frees().count();
+        };
         for _ in 0..1000 {
-            match rng.random_range(0..10) {
+            match rng.random_range(0..12) {
                 0..4 => {
-                    let len = rng.random_range(1..=5);
-                    let key: Vec<_> = (0..len)
-                        .map(|_| LocalBlockHash(rng.random_range(1..=3)))
-                        .collect();
+                    // Prefixes of a few long prompts that share their first
+                    // pages, so demoted leaves are long enough to load back.
+                    let prompt = &prompts[rng.random_range(0..prompts.len())];
+                    let key = prompt[..rng.random_range(1..=prompt.len())].to_vec();
                     if insert_pages(&mut cache, &key).is_some() {
                         inserted.push(key);
                     }
                 }
                 4..6 if !inserted.is_empty() => {
                     let key = &inserted[rng.random_range(0..inserted.len())];
-                    let prefix = rng.random_range(1..=key.len());
-                    let (_, node) = cache.match_prefix_hashes_and_lock(&key[..prefix]);
-                    locked.push(node);
+                    let prefix = if rng.random_bool(0.7) {
+                        key.len()
+                    } else {
+                        rng.random_range(1..=key.len())
+                    };
+                    let matched = cache.match_prefix_with_host_and_lock(&key[..prefix]);
+                    let Some(hit) = matched.host_hit else {
+                        locked.push(matched.last_node);
+                        continue;
+                    };
+                    let quota = rng.random_bool(0.2).then(|| rng.random_range(0..=24));
+                    match cache.load_back(hit, quota) {
+                        LoadBackResult::Loaded(loaded) => {
+                            loads += 1;
+                            absorb(&loaded.eviction, cache.page_size());
+                            assert_eq!(loaded.tokens, loaded.pages.len() * cache.page_size());
+                            assert_eq!(loaded.tokens, hit.tokens());
+                            let path = cache.collect_path_pages_through(
+                                loaded.last_node,
+                                matched.device_tokens + loaded.tokens,
+                            );
+                            assert!(path.ends_with(
+                                &loaded.pages.iter().map(|&(_, d)| d).collect::<Vec<_>>()
+                            ));
+                            locked.push(loaded.last_node);
+                            pending.push(loaded.handle);
+                        }
+                        LoadBackResult::Refused { eviction, .. } => {
+                            refusals += 1;
+                            absorb(&eviction, cache.page_size());
+                            locked.push(matched.last_node);
+                        }
+                    }
                 }
                 6..8 if !locked.is_empty() => {
                     let node = locked.swap_remove(rng.random_range(0..locked.len()));
                     cache.dec_lock_ref(node);
                 }
+                8..10 if !pending.is_empty() => {
+                    let handle = pending.swap_remove(rng.random_range(0..pending.len()));
+                    cache.finish_load_back(handle);
+                    finishes += 1;
+                }
                 _ => {
-                    let outcome = cache.evict(rng.random_range(1..=12));
-                    assert_eq!(
-                        outcome.evicted_tokens,
-                        outcome.device_pages.len() * cache.page_size()
-                    );
-                    for (_, device) in outcome.stored_host() {
-                        assert!(outcome.device_pages.contains(&device));
-                    }
-                    demotes += outcome.stored_host().count();
-                    host_frees += outcome.host_frees().count();
+                    let outcome = cache.evict(rng.random_range(1..=24));
+                    absorb(&outcome, cache.page_size());
                 }
             }
-            assert_pool_accounting(&cache);
+            assert_pool_accounting_with_loads(&cache, &pending.iter().collect::<Vec<_>>());
         }
         assert!(
-            demotes > 0 && host_frees > 0,
-            "{demotes} demotes, {host_frees} host frees"
+            demotes > 0 && host_frees > 0 && loads > 0 && refusals > 0 && finishes > 0,
+            "{demotes} demotes, {host_frees} host frees, {loads} loads, \
+             {refusals} refusals, {finishes} finishes"
         );
 
+        for handle in pending.drain(..) {
+            cache.finish_load_back(handle);
+        }
         for node in locked.drain(..) {
             cache.dec_lock_ref(node);
         }
+        assert_eq!(cache.protected_size(), 0);
         cache.evict(cache.total_tokens());
         assert_eq!(cache.available_tokens(), cache.total_tokens());
+        assert_pool_accounting(&cache);
+    }
+
+    /// Free host pages the way SGLang `evict_host` does (URC:1368-1380).
+    fn evict_host(cache: &mut RadixCache, pages: usize) -> EvictionOutcome {
+        let mut outcome = EvictionOutcome::default();
+        let step = cache.tree.drive_host_eviction(FULL, pages);
+        cache.absorb_eviction_step(None, &mut outcome, step);
+        assert!(outcome.device_pages.is_empty());
+        outcome
+    }
+
+    fn device_lock_ref(cache: &RadixCache, node: NodeId) -> u32 {
+        cache
+            .tree
+            .inspect_get_component_device_lock_ref(node, FULL)
+            .unwrap()
+    }
+
+    /// Insert `key`, demote it to host, and return its node and host pages.
+    fn demoted(cache: &mut RadixCache, key: &[LocalBlockHash]) -> (NodeId, Vec<HostPageId>) {
+        let node = insert_pages(cache, key).unwrap();
+        let tokens = key.len() * cache.page_size();
+        let outcome = cache.evict(tokens);
+        assert_eq!(outcome.stored_host().count(), key.len());
+        (node, host_pages(cache, node).unwrap())
+    }
+
+    fn expect_loaded(result: LoadBackResult) -> LoadedBack {
+        match result {
+            LoadBackResult::Loaded(loaded) => *loaded,
+            LoadBackResult::Refused { reason, .. } => panic!("load-back refused: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn host_aware_match_reports_host_hit_after_demote() {
+        let mut cache = RadixCache::new_write_back(16, 4, 4);
+        let key = keys(&[1, 2, 3]);
+        let (node, _) = demoted(&mut cache, &key);
+
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+
+        assert_eq!(matched.device_tokens, 0);
+        assert_eq!(matched.last_node, cache.root());
+        assert_eq!(matched.host_tokens(), 12);
+        assert_eq!(matched.host_hit.unwrap().best_node, node);
+        // The device-only callers and the read-only score are unchanged.
+        cache.dec_lock_ref(matched.last_node);
+        assert_eq!(cache.match_prefix_hashes_and_lock(&key), (0, cache.root()));
+        cache.dec_lock_ref(cache.root());
+        assert_eq!(cache.prefix_match_hashes_len(&key), 0);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn host_aware_match_without_host_hit_matches_device_only_path() {
+        let mut cache = RadixCache::new_write_back(16, 4, 4);
+        let key = keys(&[1, 2]);
+        let node = insert_pages(&mut cache, &key).unwrap();
+
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+
+        assert_eq!((matched.device_tokens, matched.last_node), (8, node));
+        assert!(matched.host_hit.is_none());
+        assert_eq!(matched.host_tokens(), 0);
+        assert_eq!(device_lock_ref(&cache, node), 1);
+        cache.dec_lock_ref(node);
+    }
+
+    #[test]
+    fn load_back_below_threshold_is_refused_with_locks_balanced() {
+        // Two pages of two tokens: 4 tokens, below SGLang's threshold of 10.
+        let mut cache = RadixCache::new_write_back(8, 2, 4);
+        let key = keys(&[1, 2]);
+        let (node, host) = demoted(&mut cache, &key);
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        assert_eq!(matched.host_tokens(), 4);
+
+        let result = cache.load_back(matched.host_hit.unwrap(), None);
+
+        assert!(matches!(
+            result,
+            LoadBackResult::Refused {
+                reason: LoadBackRefusal::BelowThreshold,
+                ref eviction,
+            } if *eviction == EvictionOutcome::default()
+        ));
+        assert_eq!(device_lock_ref(&cache, node), 0);
+        assert!(host_pages(&cache, node).is_some());
+        assert_eq!(cache.available_tokens(), 8);
+        // The request keeps its lock where the match put it.
+        cache.dec_lock_ref(matched.last_node);
+        // No host lock is left: host eviction can reclaim the node.
+        let outcome = evict_host(&mut cache, 2);
+        assert_eq!(outcome.host_frees().collect::<Vec<_>>(), host);
+        assert!(!cache.tree.inspect_contains_node(node));
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn load_back_over_quota_or_without_device_room_is_refused() {
+        let mut cache = RadixCache::new_write_back(16, 4, 4);
+        let key = keys(&[1, 2, 3]);
+        let (node, host) = demoted(&mut cache, &key);
+
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        let result = cache.load_back(matched.host_hit.unwrap(), Some(11));
+        assert!(matches!(
+            result,
+            LoadBackResult::Refused {
+                reason: LoadBackRefusal::OverQuota,
+                ..
+            }
+        ));
+        cache.dec_lock_ref(matched.last_node);
+
+        // Fill the device with a locked prefix so eviction cannot make room.
+        let other = keys(&[7, 8]);
+        let other_node = insert_pages(&mut cache, &other).unwrap();
+        let (_, pinned) = cache.match_prefix_hashes_and_lock(&other);
+        assert_eq!(pinned, other_node);
+        let filler = cache.page_pool.allocate_pages(2).unwrap();
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        let result = cache.load_back(matched.host_hit.unwrap(), None);
+        assert!(matches!(
+            result,
+            LoadBackResult::Refused {
+                reason: LoadBackRefusal::NoDeviceRoom,
+                ref eviction,
+            } if *eviction == EvictionOutcome::default()
+        ));
+        assert_eq!(device_lock_ref(&cache, node), 0);
+        cache.dec_lock_ref(matched.last_node);
+        cache.dec_lock_ref(pinned);
+        cache.page_pool.free_pages(&filler);
+
+        // Neither refusal left a host lock behind.
+        let outcome = evict_host(&mut cache, 3);
+        assert_eq!(outcome.host_frees().collect::<Vec<_>>(), host);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn load_back_restores_device_hit_and_pins_until_finished() {
+        let mut cache = RadixCache::new_write_back(16, 4, 4);
+        let key = keys(&[1, 2, 3]);
+        let (node, host) = demoted(&mut cache, &key);
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+
+        let loaded = expect_loaded(cache.load_back(matched.host_hit.unwrap(), None));
+
+        assert_eq!(loaded.tokens, 12);
+        assert_eq!(loaded.eviction, EvictionOutcome::default());
+        assert_eq!(
+            loaded.pages.iter().map(|&(h, _)| h).collect::<Vec<_>>(),
+            host
+        );
+        let device: Vec<_> = loaded.pages.iter().map(|&(_, d)| d).collect();
+        assert_eq!(cache.available_tokens(), 4);
+        // The request lock moved from the matched device node to the loaded node.
+        assert_eq!(loaded.last_node, node);
+        assert_eq!(
+            cache.collect_path_pages_through(
+                loaded.last_node,
+                matched.device_tokens + loaded.tokens
+            ),
+            device
+        );
+        assert_eq!(device_lock_ref(&cache, node), 2, "request + in-flight load");
+        assert_eq!(cache.match_prefix_hashes(&key), (12, node));
+        assert_eq!(cache.prefix_match_hashes_len(&key), 12);
+        assert_pool_accounting_with_loads(&cache, &[&loaded.handle]);
+
+        // The request finishes before the H2D does: the in-flight load still
+        // keeps the node off the eviction walk and off demote.
+        cache.dec_lock_ref(loaded.last_node);
+        assert_eq!(cache.evict(16), EvictionOutcome::default());
+        let step = cache.tree.demote(node).unwrap();
+        assert!(step.device_frees.is_empty() && step.host_frees.is_empty());
+        // The host copy is pinned against coexist reclaim too.
+        assert_eq!(evict_host(&mut cache, 3), EvictionOutcome::default());
+
+        cache.finish_load_back(loaded.handle);
+
+        assert_eq!(device_lock_ref(&cache, node), 0);
+        assert_eq!(cache.protected_size(), 0);
+        assert_eq!(cache.evictable_size(), 12);
+        // Host eviction now reclaims the coexisting copy and keeps device KV.
+        let outcome = evict_host(&mut cache, 3);
+        assert_eq!(
+            outcome.host_events,
+            host.iter()
+                .copied()
+                .map(HostPageEvent::Freed)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(host_pages(&cache, node), None);
+        assert_eq!(cache.collect_path_pages(node), device);
+        assert_eq!(cache.match_prefix_hashes(&key), (12, node));
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn load_back_single_page_reclaims_with_one_free_event() {
+        let mut cache = RadixCache::new_write_back(32, 16, 2);
+        let key = keys(&[5]);
+        let (node, host) = demoted(&mut cache, &key);
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        let loaded = expect_loaded(cache.load_back(matched.host_hit.unwrap(), None));
+        cache.dec_lock_ref(loaded.last_node);
+        cache.finish_load_back(loaded.handle);
+
+        let outcome = evict_host(&mut cache, 1);
+
+        assert_eq!(outcome.host_events, vec![HostPageEvent::Freed(host[0])]);
+        assert_eq!(cache.collect_path_pages(node), vec![loaded.pages[0].1]);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn load_back_below_a_device_prefix_extends_the_request_prefix() {
+        let mut cache = RadixCache::new_write_back(24, 4, 4);
+        let prefix = insert_pages(&mut cache, &keys(&[1])).unwrap();
+        let key = keys(&[1, 2, 3, 4]);
+        let leaf = insert_pages(&mut cache, &key).unwrap();
+        cache.inc_lock_ref(prefix);
+        cache.evict(12);
+        cache.dec_lock_ref(prefix);
+        let prefix_page = cache.collect_path_pages(prefix);
+
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        assert_eq!((matched.device_tokens, matched.last_node), (4, prefix));
+        assert_eq!(matched.host_tokens(), 12);
+        let loaded = expect_loaded(cache.load_back(matched.host_hit.unwrap(), None));
+
+        assert_eq!(loaded.last_node, leaf);
+        assert_eq!(device_lock_ref(&cache, leaf), 2);
+        let mut expected = prefix_page;
+        expected.extend(loaded.pages.iter().map(|&(_, d)| d));
+        assert_eq!(cache.collect_path_pages_through(leaf, 16), expected);
+        cache.dec_lock_ref(loaded.last_node);
+        cache.finish_load_back(loaded.handle);
+        assert_eq!(device_lock_ref(&cache, prefix), 0);
+        assert_eq!(cache.protected_size(), 0);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn load_back_under_device_pressure_writes_back_other_leaves() {
+        let mut cache = RadixCache::new_write_back(16, 4, 8);
+        let key = keys(&[1, 2, 3]);
+        let (node, _) = demoted(&mut cache, &key);
+        let other = insert_pages(&mut cache, &keys(&[7, 8, 9])).unwrap();
+        let other_device = cache.collect_path_pages(other);
+        assert_eq!(cache.available_tokens(), 4);
+
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        let loaded = expect_loaded(cache.load_back(matched.host_hit.unwrap(), None));
+
+        assert_eq!(loaded.eviction.device_pages, other_device);
+        assert_eq!(loaded.eviction.evicted_tokens, 12);
+        assert_eq!(
+            loaded
+                .eviction
+                .stored_host()
+                .map(|(_, d)| d)
+                .collect::<Vec<_>>(),
+            other_device
+        );
+        assert!(host_pages(&cache, other).is_some());
+        assert_eq!(loaded.tokens, 12);
+        assert_eq!(cache.match_prefix_hashes(&key), (12, node));
+        assert_pool_accounting_with_loads(&cache, &[&loaded.handle]);
+        cache.dec_lock_ref(loaded.last_node);
+        cache.finish_load_back(loaded.handle);
+        assert_pool_accounting(&cache);
+    }
+
+    #[test]
+    fn stale_host_hit_is_refused() {
+        let mut cache = RadixCache::new_write_back(16, 4, 4);
+        let key = keys(&[1, 2, 3]);
+        demoted(&mut cache, &key);
+        let matched = cache.match_prefix_with_host_and_lock(&key);
+        cache.dec_lock_ref(matched.last_node);
+        evict_host(&mut cache, 3);
+        cache.inc_lock_ref(matched.last_node);
+
+        let result = cache.load_back(matched.host_hit.unwrap(), None);
+
+        assert!(matches!(
+            result,
+            LoadBackResult::Refused {
+                reason: LoadBackRefusal::Stale,
+                ..
+            }
+        ));
+        cache.dec_lock_ref(matched.last_node);
         assert_pool_accounting(&cache);
     }
 
