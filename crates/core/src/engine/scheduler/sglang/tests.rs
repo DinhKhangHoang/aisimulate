@@ -2629,10 +2629,14 @@ mod forward_pass_metrics {
 
     #[test]
     fn test_single_token_requests_finish_in_the_prefill_pass_without_kv_slots() {
-        // Two 4-token prompts with `max_output_tokens = 1` fill two of three pages. SGLang finishes
+        // Two 4-token prompts with `max_output_tokens = 1` fill two of five pages. SGLang finishes
         // them in `process_batch_result_prefill` → `check_finished()`: the sampled token never gets
-        // a KV slot, so there is no decode forward and no memory pressure at all.
-        let mut core = SglangCore::new(three_page_args());
+        // a KV slot, so there is no decode forward and no memory pressure at all. Five pages, not
+        // three: SGLang's whole-prompt admission gate (4 + 1 + one page each) admits only one of
+        // them per pass from a three-page pool.
+        let mut args = three_page_args();
+        args.num_gpu_blocks = 5;
+        let mut core = SglangCore::new(args);
         let r1 = Uuid::from_u128(1);
         let r2 = Uuid::from_u128(2);
         for (uuid, tokens) in [(r1, (0..4).collect::<Vec<_>>()), (r2, (100..104).collect())] {
@@ -3320,7 +3324,9 @@ mod admission_validation_rollback {
         core.try_execute_pass(&mut collector, 2.0).unwrap();
         assert_eq!(core.waiting[0].materialized_tokens, 8);
         assert!(core.waiting[0].kv_lease.is_active());
-        let fresh = core.receive(direct_request((200..212).collect(), 1));
+        // Eight tokens, so the whole-prompt admission gate (8 + 1 + 4 = 13) still fits beside the
+        // continuation's remaining 12-token chunk while the two pages it needs force an eviction.
+        let fresh = core.receive(direct_request((200..208).collect(), 1));
         // LPM changes this order during the rejected pass. Rollback must restore
         // the original order, including the continuation's existing ownership.
         core.waiting.swap(0, 1);
@@ -3951,5 +3957,181 @@ mod hicache_write_back {
         fail.store(false, Ordering::Relaxed);
         let pass = core.try_execute_hidden_pass(0.0).unwrap();
         assert_eq!(pass.admissions.len(), 1);
+    }
+}
+
+/// SGLang 0.5.18 `PrefillAdder.add_one_req` whole-prompt admission gate
+/// (`schedule_policy.py:1223-1238`, re-checked after the prefix lock at 1275):
+/// a waiting request needs room for its whole remaining prompt past the device
+/// prefix, host hit included, plus its clipped output reserve and a page.
+mod admission_gate {
+    use super::*;
+    use crate::engine::common::protocols::KvEventPublishers;
+
+    const PAGE: usize = 4;
+    const POOL: usize = 64;
+
+    fn config(chunk: usize) -> SglangConfig {
+        SglangConfig::from_args(&test_args(POOL / PAGE, PAGE, chunk))
+    }
+
+    fn request(tokens: Vec<u32>, max_output_tokens: usize) -> SglangRequest {
+        SglangRequest {
+            is_decode_handoff: false,
+            uuid: Uuid::new_v4(),
+            prompt_len: tokens.len(),
+            sequence_tokens: tokens,
+            max_output_tokens,
+            planned_output_ids: None,
+            materialized_tokens: 0,
+            kv_lease: RadixRequestLease::default(),
+            allocated_tokens: 0,
+            first_admission_recorded: false,
+        }
+    }
+
+    /// A running request that only contributes its decode reserve: at
+    /// `new_token_ratio` 1.0 it holds back `remaining` tokens of `rem_total_tokens`.
+    fn reserve(remaining: usize) -> Vec<SglangRequest> {
+        vec![request(vec![9_000], remaining)]
+    }
+
+    fn cache_prompt(kv: &mut SglangKvManager, tokens: &[u32]) {
+        let alloc = kv.allocate_for_request(tokens).unwrap();
+        kv.finish(tokens, alloc.lease);
+    }
+
+    fn prefill(
+        kv: &mut SglangKvManager,
+        req: SglangRequest,
+        chunk: usize,
+        running: &[SglangRequest],
+    ) -> (super::super::prefill::AdmitResult, WaitingQueue) {
+        let mut waiting = WaitingQueue::from([req]);
+        let admit = get_new_batch_prefill(&mut waiting, kv, &config(chunk), 1.0, running);
+        (admit, waiting)
+    }
+
+    /// The gate charges the whole 20-token prompt (+2 output +1 page = 26),
+    /// not the 8-token chunk, against `rem_total_tokens` = 64 - reserve.
+    #[test]
+    fn gate_counts_the_whole_remaining_prompt_not_the_chunk() {
+        for (reserved, admitted) in [(38, false), (37, true)] {
+            let mut kv = SglangKvManager::new(POOL, PAGE, KvEventPublishers::default(), 0);
+            let (admit, waiting) = prefill(
+                &mut kv,
+                request((0..20).collect(), 2),
+                8,
+                &reserve(reserved),
+            );
+            assert_eq!(
+                admit.can_run.len(),
+                usize::from(admitted),
+                "reserve {reserved}"
+            );
+            assert_eq!(waiting.len(), usize::from(!admitted));
+            if admitted {
+                assert_eq!(admit.can_run[0].materialized_tokens, 8);
+            } else {
+                assert_eq!(kv.cache().available_tokens(), POOL, "nothing allocated");
+            }
+        }
+    }
+
+    /// A host hit is loaded back, not recomputed, but SGLang's gate still
+    /// counts it: `prefix_indices` is the device prefix only. 40 + 2 + 4 = 46.
+    #[test]
+    fn gate_counts_host_hit_tokens_as_needing_device_room() {
+        for (reserved, admitted) in [(18, false), (17, true)] {
+            let mut kv = SglangKvManager::new_write_back(
+                POOL,
+                PAGE,
+                64,
+                KvEventPublishers::default(),
+                0,
+                false,
+            );
+            let cached: Vec<u32> = (0..32).collect();
+            cache_prompt(&mut kv, &cached);
+            kv.evict(POOL);
+            assert_eq!(kv.cache().evictable_size(), 0, "prefix demoted to host");
+            let (admit, waiting) = prefill(
+                &mut kv,
+                request((0..40).collect(), 2),
+                8,
+                &reserve(reserved),
+            );
+            assert_eq!(
+                admit.can_run.len(),
+                usize::from(admitted),
+                "reserve {reserved}"
+            );
+            assert_eq!(waiting.len(), usize::from(!admitted));
+            assert_eq!(
+                admit.host_loads.len(),
+                usize::from(admitted),
+                "a gated request starts no load-back"
+            );
+            if admitted {
+                assert_eq!(admit.prefill_fpm[0].prefix_tokens, 32);
+                assert_eq!(admit.prefill_fpm[0].tokens_computed, 8);
+            }
+        }
+    }
+
+    /// The decisive check runs after the request locks its device prefix
+    /// (`schedule_policy.py:1275`): a matched prefix that was evictable no
+    /// longer counts as room. Here 32 cached tokens are evictable; the request
+    /// needs 8 + 2 + 4 = 14 of `32 - reserve` once they are locked.
+    #[test]
+    fn gate_rechecks_after_locking_the_device_prefix() {
+        for (reserved, admitted) in [(18, false), (17, true)] {
+            let mut kv = SglangKvManager::new(POOL, PAGE, KvEventPublishers::default(), 0);
+            cache_prompt(&mut kv, &(0..32).collect::<Vec<u32>>());
+            assert_eq!(kv.cache().evictable_size(), 32);
+            let (admit, waiting) = prefill(
+                &mut kv,
+                request((0..40).collect(), 2),
+                8,
+                &reserve(reserved),
+            );
+            assert_eq!(
+                admit.can_run.len(),
+                usize::from(admitted),
+                "reserve {reserved}"
+            );
+            assert_eq!(waiting.len(), usize::from(!admitted));
+            if admitted {
+                assert_eq!(admit.prefill_fpm[0].prefix_tokens, 32);
+            } else {
+                assert_eq!(kv.cache().evictable_size(), 32, "the lock is released");
+            }
+        }
+    }
+
+    /// A chunked continuation is SGLang's `add_chunked_req`, which has no
+    /// whole-prompt gate: it only charges its next chunk.
+    #[test]
+    fn chunked_continuation_is_not_gated_on_the_whole_prompt() {
+        let mut kv = SglangKvManager::new(POOL, PAGE, KvEventPublishers::default(), 0);
+        let (mut admit, _) = prefill(&mut kv, request((0..20).collect(), 2), 8, &[]);
+        let first = admit.can_run.pop().unwrap();
+        assert_eq!(first.materialized_tokens, 8);
+        // rem_total = 56 - 40 = 16: the 8-token chunk fits, the whole
+        // remainder (12 + 2 + 4 = 18) would not.
+        let (admit, waiting) = prefill(&mut kv, first, 8, &reserve(40));
+        assert_eq!(admit.can_run.len(), 1);
+        assert!(waiting.is_empty());
+        assert_eq!(admit.can_run[0].materialized_tokens, 16);
+    }
+
+    /// SGLang clamps `max_new_tokens` at arrival so that an empty pool can
+    /// always admit the request (`Scheduler.init_req_max_new_tokens`):
+    /// 40 + min(100, 64 - 40 - 4 - 1 = 19) + 4 = 63 < 64.
+    #[test]
+    fn output_reserve_is_clamped_so_an_empty_pool_admits() {
+        let mut kv = SglangKvManager::new(POOL, PAGE, KvEventPublishers::default(), 0);
+        let (admit, _) = prefill(&mut kv, request((0..40).collect(), 100), 8, &[]);
+        assert_eq!(admit.can_run.len(), 1);
     }
 }

@@ -9,7 +9,7 @@ use super::request::{SglangRequest, WaitingQueue};
 use crate::engine::CacheTierAttribution;
 use crate::engine::kv_manager::SglangKvManager;
 use crate::engine::kv_manager::sglang_backend::{
-    AdmittedPrefix, HostLoad, LoadBackGate, RequestAdmission,
+    AdmittedPrefix, HostLoad, LoadBackGate, PrefixLock, RequestAdmission,
 };
 
 /// Per-request prefill data needed for FPM snapshot construction.
@@ -63,6 +63,13 @@ pub(super) fn get_new_batch_prefill(
     // a second time here.
     let mut rem_total_tokens =
         (cache.available_tokens() + cache.evictable_size()) as f64 - reserved_decode_output;
+    // `rem_total_tokens` above is a snapshot: the sim allocates each admitted chunk at once and
+    // charges it, while SGLang's `rem_total_tokens` property is live and allocates after the
+    // adder loop. What the snapshot misses is what SGLang's live property sees during the loop
+    // besides the charges: device prefixes that admitted requests locked (no longer evictable)
+    // and host hits they loaded back (`init_load_back` allocates at once).
+    let mut held_in_batch = 0usize;
+    let total_pool_tokens = cache.total_tokens();
     let mut rem_input_tokens = config.max_prefill_tokens as f64;
     let mut rem_chunk_tokens = config.chunked_prefill_size as f64;
 
@@ -135,6 +142,8 @@ pub(super) fn get_new_batch_prefill(
 
         let mut chunk_end = start + chunk_tokens;
         let first_admission = req.materialized_tokens == 0;
+        let gate_tokens = whole_prompt_gate_tokens(&req, config, total_pool_tokens);
+        let mut locked_evictable = 0usize;
         let mut lease = std::mem::take(&mut req.kv_lease);
         let alloc_tokens = req.sequence_prefix(chunk_end);
 
@@ -179,12 +188,21 @@ pub(super) fn get_new_batch_prefill(
                 chunk_end = prefix_len + chunk;
                 chunk_end
             };
-            kv_manager.admit_request_lease(
+            let rem_total_before_lock = rem_total_tokens - held_in_batch as f64;
+            let budget = |lock: PrefixLock| {
+                locked_evictable = lock.locked_evictable_tokens;
+                gate_tokens.is_none_or(|tokens| {
+                    let needed = tokens.saturating_sub(lock.device_tokens) as f64;
+                    needed < rem_total_before_lock - lock.locked_evictable_tokens as f64
+                })
+            };
+            kv_manager.admit_request_lease_gated(
                 alloc_tokens,
                 &mut lease,
                 start,
                 LoadBackGate::Allow,
                 fit,
+                budget,
             )
         };
 
@@ -273,6 +291,7 @@ pub(super) fn get_new_batch_prefill(
         total_isl += chunk_end;
         total_prefix += prefix_len;
         rem_total_tokens -= charged_input_tokens + output_reserve as f64;
+        held_in_batch += locked_evictable + loaded_tokens;
         rem_input_tokens -= charged_input_tokens;
         rem_chunk_tokens -= charged_input_tokens;
         can_run.push(req);
@@ -294,6 +313,38 @@ pub(super) fn get_new_batch_prefill(
         prefill_fpm,
         host_loads,
     }
+}
+
+/// Tokens SGLang 0.5.18's whole-prompt admission gate needs for a request from the waiting queue
+/// before its device prefix is subtracted (`PrefillAdder.add_one_req`, `schedule_policy.py`
+/// 1223-1238, re-checked after `_lock_node` at 1270-1276):
+/// `len(full_untruncated_fill_ids) + min(max_new_tokens - len(output_ids), CLIP_MAX_NEW_TOKENS)
+/// + page_size`, admitted only if `total - len(prefix_indices) < rem_total_tokens`.
+/// `prefix_indices` is the device prefix, so a host hit still needs device room, and the whole
+/// remaining prompt counts, not the chunk. Chunked continuations (`add_chunked_req`) and the
+/// budget charges are not gated by this.
+///
+/// `max_new_tokens` is first clamped as SGLang does at arrival (`Scheduler.init_req_max_new_tokens`,
+/// `scheduler.py:2190-2207`) so that an empty pool always admits the request. A sequence that
+/// cannot pass even then (`len + page_size >= pool`) is one SGLang rejects at validation
+/// (`validate_input_length`); the sim keeps admitting it chunk by chunk, so it is not gated (`None`).
+fn whole_prompt_gate_tokens(
+    req: &SglangRequest,
+    config: &SglangConfig,
+    total_pool_tokens: usize,
+) -> Option<usize> {
+    let sequence_len = req.current_sequence_len();
+    if sequence_len + config.block_size >= total_pool_tokens {
+        return None;
+    }
+    let max_new_cap = total_pool_tokens
+        .saturating_sub(ceil_to_block(req.prompt_len(), config.block_size) + config.block_size + 1);
+    let max_new = req
+        .max_output_tokens
+        .min(max_new_cap)
+        .saturating_sub(req.output_len())
+        .min(config.clip_max_new_tokens);
+    Some(sequence_len + max_new + config.block_size)
 }
 
 /// SGLang `add_one_req` chunk sizing: the whole `extend_input` if its paged size fits the chunk

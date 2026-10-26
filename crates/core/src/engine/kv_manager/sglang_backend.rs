@@ -205,6 +205,18 @@ pub(crate) struct AdmittedPrefix {
     pub(crate) load: Option<Box<HostLoad>>,
 }
 
+/// The device prefix a waiting request has just matched and locked, passed to
+/// the admission budget of [`SglangKvManager::admit_request_lease_gated`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefixLock {
+    /// Matched device prefix tokens, host hit excluded (SGLang `prefix_indices`
+    /// before `init_load_back`).
+    pub(crate) device_tokens: usize,
+    /// Evictable tokens that the lock took out of `evictable_size()`: the part
+    /// of the device prefix no other request held.
+    pub(crate) locked_evictable_tokens: usize,
+}
+
 /// An in-flight H2D load-back started at admission. The scheduler times the
 /// copy and then passes `handle` to [`SglangKvManager::finish_load_back`].
 #[derive(Debug)]
@@ -653,7 +665,7 @@ impl SglangKvManager {
         max_prefix_tokens: usize,
     ) -> Option<usize> {
         let len = token_ids.len();
-        match self.allocate_lease(token_ids, lease, max_prefix_tokens, None, |_| len) {
+        match self.allocate_lease(token_ids, lease, max_prefix_tokens, None, |_| len, |_| true) {
             RequestAdmission::Admitted(AdmittedPrefix {
                 prefix_len,
                 load: None,
@@ -682,6 +694,7 @@ impl SglangKvManager {
     ///   below the prefix. A caller that sized `token_ids` around a host hit
     ///   re-sizes its chunk with it if the load was refused (SGLang
     ///   `add_one_req` recomputes `input_tokens` after `init_load_back`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn admit_request_lease(
         &mut self,
         token_ids: &[u32],
@@ -690,7 +703,24 @@ impl SglangKvManager {
         gate: LoadBackGate,
         fit: impl FnOnce(usize) -> usize,
     ) -> RequestAdmission {
-        self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate), fit)
+        self.admit_request_lease_gated(token_ids, lease, max_prefix_tokens, gate, fit, |_| true)
+    }
+
+    /// [`Self::admit_request_lease`] with an admission budget. `budget` runs
+    /// once the device prefix is matched and locked, before any load-back or
+    /// eviction, as SGLang re-checks `rem_total_tokens` after `_lock_node`
+    /// (`schedule_policy.py:1270-1276`). If it returns `false` the lock is
+    /// released and the request gets [`RequestAdmission::NoRoom`] with no load.
+    pub(crate) fn admit_request_lease_gated(
+        &mut self,
+        token_ids: &[u32],
+        lease: &mut RadixRequestLease,
+        max_prefix_tokens: usize,
+        gate: LoadBackGate,
+        fit: impl FnOnce(usize) -> usize,
+        budget: impl FnOnce(PrefixLock) -> bool,
+    ) -> RequestAdmission {
+        self.allocate_lease(token_ids, lease, max_prefix_tokens, Some(gate), fit, budget)
     }
 
     /// Prefix a waiting request can reuse under SGLang HiCache write_back:
@@ -716,7 +746,8 @@ impl SglangKvManager {
     }
 
     /// `gate` is `None` for the device-only path, which ignores host hits.
-    /// See [`Self::admit_request_lease`] for `fit`.
+    /// See [`Self::admit_request_lease`] for `fit` and
+    /// [`Self::admit_request_lease_gated`] for `budget`.
     fn allocate_lease(
         &mut self,
         token_ids: &[u32],
@@ -724,6 +755,7 @@ impl SglangKvManager {
         max_prefix_tokens: usize,
         gate: Option<LoadBackGate>,
         fit: impl FnOnce(usize) -> usize,
+        budget: impl FnOnce(PrefixLock) -> bool,
     ) -> RequestAdmission {
         assert!(!lease.is_active(), "request KV lease is already active");
         debug_assert!(lease.pages.is_empty(), "inactive KV lease retains pages");
@@ -737,9 +769,19 @@ impl SglangKvManager {
         if self.enable_prefix_caching {
             self.checkpoint_admission();
         }
+        let evictable_before_lock = self.cache.evictable_size();
         let matched = self.match_prefix_with_host_and_lock(matchable_hashes);
         let mut prefix_len = matched.device_tokens;
         let mut last_node = matched.last_node;
+        let prefix_lock = PrefixLock {
+            device_tokens: prefix_len,
+            locked_evictable_tokens: evictable_before_lock
+                .saturating_sub(self.cache.evictable_size()),
+        };
+        if !budget(prefix_lock) {
+            self.cache.dec_lock_ref(last_node);
+            return RequestAdmission::NoRoom { load: None };
+        }
         let total_pages = token_ids.len().div_ceil(page_size);
         let required_tokens = (total_pages - prefix_len / page_size) * page_size;
 

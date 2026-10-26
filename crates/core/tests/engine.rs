@@ -183,7 +183,9 @@ fn backends_reserve_only_context_capped_output(
     });
     config.rank.backend = backend;
     config.rank.max_model_len = Some(8);
-    config.rank.num_gpu_blocks = 5;
+    // Six pages of four: SGLang's whole-prompt admission gate needs 4 + 4 + one page per request
+    // beside the first one's 8-token charge, which five pages cannot hold.
+    config.rank.num_gpu_blocks = 6;
     config.rank.enable_prefix_caching = false;
     let mut replay = spec(config);
     replay.requests = vec![request("a", 0.0, 4, 100), request("b", 0.0, 4, 100)];
